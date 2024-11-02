@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/pacer"
 	"io"
@@ -13,10 +14,11 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/rest"
 )
 
 const (
-	defaultEndpoint = "https://fs.shade.inc"
+	defaultEndpoint = "http://localhost:8001"
 	minSleep        = 10 * time.Millisecond
 	maxSleep        = 5 * time.Minute
 	decayConstant   = 1 // bigger for slower decay, exponential
@@ -67,6 +69,10 @@ type Fs struct {
 	root     string
 	opt      Options
 	features *fs.Features
+
+	srv *rest.Client
+
+	endpoint string
 
 	pacer *fs.Pacer
 	// todo drive
@@ -229,12 +235,72 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:  *opt,
 		// No features get rekt
 		features: &fs.Features{},
+
+		srv: rest.NewClient(fshttp.NewClient(ctx)),
 		// Pacer
 		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 
+	if opt.Endpoint == "" {
+		f.endpoint = defaultEndpoint
+	}
+
 	return f, nil
 }
+
+/*
+[
+
+	{
+	  "type": "file",
+	  "path": "/.fseventsd",
+	  "ino": 2,
+	  "mtime": 0,
+	  "ctime": 0,
+	  "size": 0,
+	  "hash": "main-0-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+	  "draft": false
+	}
+
+]
+*/
+type ListDirResponse struct {
+	Type  string `json:"type"`
+	Path  string `json:"path"`
+	Ino   int    `json:"ino"`
+	Mtime int64  `json:"mtime"`
+	Ctime int64  `json:"ctime"`
+	Size  int64  `json:"size"`
+	Hash  string `json:"hash"`
+	Draft bool   `json:"draft"`
+}
+
+//// errorHandler parses a non 2xx error response into an error
+//func errorHandler(resp *http.Response) error {
+//	body, err := rest.ReadBody(resp)
+//	if err != nil {
+//		fs.Errorf(nil, "Couldn't read error out of body: %v", err)
+//		body = nil
+//	}
+//	// Decode error response if there was one - they can be blank
+//	errResponse := new(api.Error)
+//	if len(body) > 0 {
+//		err = json.Unmarshal(body, errResponse)
+//		if err != nil {
+//			fs.Errorf(nil, "Couldn't decode error response: %v", err)
+//		}
+//	}
+//	if errResponse.Code == "" {
+//		errResponse.Code = "unknown"
+//	}
+//	if errResponse.Status == 0 {
+//		errResponse.Status = resp.StatusCode
+//	}
+//	if errResponse.Message == "" {
+//		errResponse.Message = "Unknown " + resp.Status
+//	}
+//	return errResponse
+//}
 
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 
@@ -266,6 +332,22 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		hash:  "8dbd7b38675abc0fe88054b783cc1d39",
 		size:  123,
 	}
+
+	opts := rest.Opts{
+		Method:  "GET",
+		Path:    "/default/fs/listdir?path=/",
+		RootURL: f.endpoint,
+	}
+
+	var response []ListDirResponse
+
+	_, err = f.srv.CallJSON(ctx, &opts, nil, &response)
+
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+	fmt.Printf("Response: %v\n", response[0].Hash)
+
 	entries = append(entries, entry2)
 
 	return entries, nil
