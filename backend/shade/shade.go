@@ -9,6 +9,8 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/pacer"
 	"io"
+	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -59,9 +61,9 @@ func init() {
 }
 
 type Options struct {
-	Workspace string `config:"drive_id"`
-	ApiKey    string `config:"api_key"`
-	Endpoint  string `config:"endpoint"`
+	Drive    string `config:"drive_id"`
+	ApiKey   string `config:"api_key"`
+	Endpoint string `config:"endpoint"`
 }
 
 type Fs struct {
@@ -73,6 +75,7 @@ type Fs struct {
 	srv *rest.Client
 
 	endpoint string
+	drive    string
 
 	pacer *fs.Pacer
 	// todo drive
@@ -114,7 +117,7 @@ func (f *Fs) Root() string {
 }
 
 func (f *Fs) String() string {
-	return fmt.Sprintf("Shade drive %s path %s", f.opt.Workspace, f.root)
+	return fmt.Sprintf("Shade drive %s path %s", f.opt.Drive, f.root)
 }
 
 func (f *Fs) Precision() time.Duration {
@@ -227,14 +230,14 @@ func (o Object) Remove(ctx context.Context) error {
 func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	opt := new(Options)
 
-	println(fmt.Sprintf("%s/%s", name, root))
-
 	f := &Fs{
 		name: name,
 		root: root, // fmt.Sprintf("%s/%s", name, root),
 		opt:  *opt,
 		// No features get rekt
 		features: &fs.Features{},
+
+		drive: opt.Drive,
 
 		srv: rest.NewClient(fshttp.NewClient(ctx)),
 		// Pacer
@@ -303,9 +306,8 @@ type ListDirResponse struct {
 //}
 
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-
 	//println(fmt.Sprintf("Listing %s", dir))
-	fmt.Printf("Dir %s\n", dir)
+	// fmt.Printf("Dir %s\n", dir)
 	//resp := rest.Opts{
 	//	Method: "GET",
 	//	Path: "/admin/fs/listdir",
@@ -314,41 +316,59 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	//err := f.pacer.Call(func () (bool, error)) {
 	//	resp, err := f.srv.CallJSON(ctx, resp, nil, &f.info)
 	//}
-	entry := &Object{
-		fs:     f,
-		remote: "folder/gotem.txt",
+	//entry := &Object{
+	//	fs:     f,
+	//	remote: "folder/gotem.txt",
+	//
+	//	mtime: 0,
+	//	hash:  "8dbd7b38675abc0fe88054b783cc1d39",
+	//	size:  123,
+	//}
+	//entries = append(entries, entry)
+	//
+	//entry2 := &Object{
+	//	fs:     f,
+	//	remote: "gotem1.txt",
+	//
+	//	mtime: 0,
+	//	hash:  "8dbd7b38675abc0fe88054b783cc1d39",
+	//	size:  123,
+	//}
 
-		mtime: 0,
-		hash:  "8dbd7b38675abc0fe88054b783cc1d39",
-		size:  123,
-	}
-	entries = append(entries, entry)
-
-	entry2 := &Object{
-		fs:     f,
-		remote: "gotem1.txt",
-
-		mtime: 0,
-		hash:  "8dbd7b38675abc0fe88054b783cc1d39",
-		size:  123,
-	}
+	encodedPath := url.QueryEscape(dir)
 
 	opts := rest.Opts{
 		Method:  "GET",
-		Path:    "/default/fs/listdir?path=/",
+		Path:    fmt.Sprintf("/%s/fs/listdir?path=%s", f.drive, encodedPath),
 		RootURL: f.endpoint,
 	}
 
+	println(fmt.Sprintf("Listing %s", opts.Path))
+
 	var response []ListDirResponse
 
-	_, err = f.srv.CallJSON(ctx, &opts, nil, &response)
+	res, err := f.srv.CallJSON(ctx, &opts, nil, &response)
 
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
+	if res.StatusCode == http.StatusNotFound {
+		return nil, fs.ErrorDirNotFound
 	}
+
 	fmt.Printf("Response: %v\n", response[0].Hash)
 
-	entries = append(entries, entry2)
+	for _, r := range response {
+		fmt.Printf("Response: %v\n", r.Path)
+		if r.Draft {
+			continue
+		}
+		entries = append(entries, &Object{
+			fs:     f,
+			remote: r.Path,
+
+			mtime: r.Mtime,
+			hash:  r.Hash,
+			size:  r.Size,
+		})
+	}
 
 	return entries, nil
 }
