@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/pacer"
@@ -39,7 +40,7 @@ func init() {
 			Name:      "drive_id",
 			Help:      "The ID of your drive, see this in the drive settings. Individual rclone configs must be made per drive.",
 			Required:  true,
-			Sensitive: true,
+			Sensitive: false,
 		}, {
 			Name:      "api_key",
 			Help:      "An API key for your account.",
@@ -94,6 +95,35 @@ type Directory struct {
 	Object
 }
 
+func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+	opt := new(Options)
+
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
+
+	f := &Fs{
+		name: name,
+		root: root, // fmt.Sprintf("%s/%s", name, root),
+		opt:  *opt,
+		// No features get rekt
+		features: &fs.Features{},
+
+		drive: opt.Drive,
+
+		srv: rest.NewClient(fshttp.NewClient(ctx)),
+		// Pacer
+		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+
+	if opt.Endpoint == "" {
+		f.endpoint = defaultEndpoint
+	}
+
+	return f, nil
+}
+
 func (d Directory) Items() int64 {
 	//TODO implement me
 	panic("implement me")
@@ -137,9 +167,49 @@ func (f *Fs) Features() *fs.Features {
 }
 
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	println("newobject")
-	//TODO implement me
-	panic("implement me")
+	encodedPath := url.QueryEscape(fmt.Sprintf("%s/%s", f.root, remote))
+
+	opts := rest.Opts{
+		Method:  "GET",
+		Path:    fmt.Sprintf("/%s/fs/attr?path=%s", f.drive, encodedPath),
+		RootURL: f.endpoint,
+	}
+
+	println(fmt.Sprintf("Listing %s", opts.Path))
+
+	var response ListDirResponse
+
+	res, _ := f.srv.CallJSON(ctx, &opts, nil, &response)
+
+	if res.StatusCode == http.StatusNotFound {
+		return nil, fs.ErrorDirNotFound
+	}
+
+	fmt.Printf("Response %s", response.Path)
+
+	var entry fs.Object
+
+	if response.Type == "file" {
+		entry = &Object{
+			fs:     f,
+			remote: response.Path[len(response.Path)+1:],
+			mtime:  response.Mtime,
+			hash:   response.Hash,
+			size:   response.Size,
+		}
+	} else {
+		entry = &Directory{
+			Object{
+				fs:     f,
+				remote: response.Path[len(response.Path)+1:],
+				mtime:  response.Mtime,
+				hash:   response.Hash,
+				size:   response.Size,
+			},
+		}
+	}
+
+	return entry, nil
 }
 
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
@@ -149,15 +219,35 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 }
 
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	println("mkdir")
-	//TODO implement me
-	panic("implement me")
+	encodedPath := url.QueryEscape(fmt.Sprintf("%s/%s", f.root, dir))
+
+	opts := rest.Opts{
+		Method:  "POST",
+		Path:    fmt.Sprintf("/%s/fs/mkdir?path=%s&email=system@shade.inc", f.drive, encodedPath),
+		RootURL: f.endpoint,
+	}
+
+	_, _ = f.srv.Call(ctx, &opts)
+
+	//if res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusInternalServerError {
+	//	return nil
+	//}
+
+	return nil
 }
 
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	println("rmdir")
-	//TODO implement me
-	panic("implement me")
+	encodedPath := url.QueryEscape(fmt.Sprintf("%s/%s", f.root, dir))
+
+	opts := rest.Opts{
+		Method:  "DELETE",
+		Path:    fmt.Sprintf("/%s/fs/delete?path=%s&email=system@shade.inc", f.drive, encodedPath),
+		RootURL: f.endpoint,
+	}
+
+	_, _ = f.srv.Call(ctx, &opts)
+
+	return nil
 }
 
 /*
@@ -180,20 +270,15 @@ func (o Object) Remote() string {
 }
 
 func (o Object) ModTime(ctx context.Context) time.Time {
-	println("modtime")
-	//TODO implement me
-	panic("implement me")
+	println("modtime might not be right")
+	return time.Unix(0, o.mtime)
 }
 
 func (o Object) Size() int64 {
-	println("size")
-	return 0
-	////TODO implement me
-	//panic("implement me")
+	return o.size
 }
 
 func (o Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
-	println("hash")
 	return o.hash, nil
 }
 
@@ -227,30 +312,6 @@ func (o Object) Remove(ctx context.Context) error {
 	panic("implement me")
 }
 
-func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
-	opt := new(Options)
-
-	f := &Fs{
-		name: name,
-		root: root, // fmt.Sprintf("%s/%s", name, root),
-		opt:  *opt,
-		// No features get rekt
-		features: &fs.Features{},
-
-		drive: opt.Drive,
-
-		srv: rest.NewClient(fshttp.NewClient(ctx)),
-		// Pacer
-		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
-	}
-
-	if opt.Endpoint == "" {
-		f.endpoint = defaultEndpoint
-	}
-
-	return f, nil
-}
-
 /*
 [
 
@@ -267,6 +328,7 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 ]
 */
+
 type ListDirResponse struct {
 	Type  string `json:"type"`
 	Path  string `json:"path"`
@@ -335,7 +397,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	//	size:  123,
 	//}
 
-	encodedPath := url.QueryEscape(dir)
+	encodedPath := url.QueryEscape(fmt.Sprintf("%s/%s", f.root, dir))
 
 	opts := rest.Opts{
 		Method:  "GET",
@@ -347,7 +409,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	var response []ListDirResponse
 
-	res, err := f.srv.CallJSON(ctx, &opts, nil, &response)
+	res, _ := f.srv.CallJSON(ctx, &opts, nil, &response)
 
 	if res.StatusCode == http.StatusNotFound {
 		return nil, fs.ErrorDirNotFound
@@ -360,14 +422,26 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		if r.Draft {
 			continue
 		}
-		entries = append(entries, &Object{
-			fs:     f,
-			remote: r.Path,
+		if r.Type == "file" {
+			entries = append(entries, &Object{
+				fs:     f,
+				remote: r.Path[len(f.root)+1:],
 
-			mtime: r.Mtime,
-			hash:  r.Hash,
-			size:  r.Size,
-		})
+				mtime: r.Mtime,
+				hash:  r.Hash,
+				size:  r.Size,
+			})
+		} else {
+			entries = append(entries, &Directory{
+				Object: Object{
+					fs:     f,
+					remote: r.Path[len(f.root)+1:],
+					mtime:  r.Mtime,
+					hash:   r.Hash,
+					size:   r.Size,
+				},
+			})
+		}
 	}
 
 	return entries, nil
