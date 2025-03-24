@@ -175,15 +175,17 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		RootURL: f.endpoint,
 	}
 
-	println(fmt.Sprintf("Listing %s", opts.Path))
+	println(fmt.Sprintf("Attring %s", opts.Path))
 
 	var response ListDirResponse
 
 	res, _ := f.srv.CallJSON(ctx, &opts, nil, &response)
 
 	if res.StatusCode == http.StatusNotFound {
-		return nil, fs.ErrorDirNotFound
+		return nil, fs.ErrorObjectNotFound
 	}
+
+	// TODO isdirectory error
 
 	fmt.Printf("Response %s", response.Path)
 
