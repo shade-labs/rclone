@@ -1,4 +1,5 @@
 // Package shade provides an interface to the Shade storage system.
+// running with: -vv copy shadefs_v1:Test "/Users/gurish/Movies/Shade/Movie Trailers" --multi-thread-cutoff 1000G
 package shade
 
 import (
@@ -79,18 +80,19 @@ type Options struct {
 
 // Fs represents a shade remote
 type Fs struct {
-	name     string       // name of this remote
-	root     string       // the path we are working on
-	opt      Options      // parsed options
-	features *fs.Features // optional features
-	srv      *rest.Client // REST client for ShadeFS API
-	apiSrv   *rest.Client // REST client for Shade API
-	endpoint string       // endpoint for ShadeFS
-	drive    string       // drive ID
-	pacer    *fs.Pacer    // pacer for API calls
-	token    string       // ShadeFS token
-	tokenExp time.Time    // Token expiration time
-	tokenMu  sync.Mutex
+	name      string       // name of this remote
+	root      string       // the path we are working on
+	opt       Options      // parsed options
+	features  *fs.Features // optional features
+	srv       *rest.Client // REST client for ShadeFS API
+	apiSrv    *rest.Client // REST client for Shade API
+	endpoint  string       // endpoint for ShadeFS
+	drive     string       // drive ID
+	pacer     *fs.Pacer    // pacer for API calls
+	token     string       // ShadeFS token
+	tokenExp  time.Time    // Token expiration time
+	tokenMu   sync.Mutex
+	recursive bool
 }
 
 // Object describes a ShadeFS object
@@ -104,7 +106,10 @@ type Object struct {
 
 // Directory describes a ShadeFS directory
 type Directory struct {
-	Object
+	fs     *Fs    // Reference to the filesystem
+	remote string // Path to the directory
+	mtime  int64  // Modification time
+	size   int64  // Size (typically 0 for directories)
 }
 
 // NewFS constructs an FS from the path, container:path
@@ -125,13 +130,14 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	f := &Fs{
-		name:   name,
-		root:   root,
-		opt:    *opt,
-		drive:  opt.Drive,
-		srv:    rest.NewClient(fshttp.NewClient(ctx)),
-		apiSrv: rest.NewClient(fshttp.NewClient(ctx)),
-		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		name:      name,
+		root:      root,
+		opt:       *opt,
+		drive:     opt.Drive,
+		srv:       rest.NewClient(fshttp.NewClient(ctx)),
+		apiSrv:    rest.NewClient(fshttp.NewClient(ctx)),
+		pacer:     fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		recursive: true,
 	}
 
 	f.features = &fs.Features{
@@ -262,8 +268,6 @@ func (f *Fs) getShadeToken(ctx context.Context) (string, error) {
 
 // List the objects and directories in dir into entries
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-
-	// Check if this looks like a single file path rather than a directory
 	if filepath.Ext(dir) != "" {
 		fs.Debugf(f, "Path appears to be a file, not a directory: %s", dir)
 		return nil, fs.ErrorNotImplemented
@@ -273,7 +277,6 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	var response []ListDirResponse
 	res, err := f.callAPI(ctx, "GET", fmt.Sprintf("/%s/fs/listdir?path=%s", f.drive, encodedPath), &response)
-
 	if err != nil {
 		fs.Debugf(f, "Error from List call: %v", err)
 		return nil, err
@@ -291,39 +294,24 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	fs.Debugf(f, "Received %d entries from server", len(response))
 	for _, r := range response {
-		// Skip draft files
 		if r.Draft {
 			fs.Debugf(f, "Skipping draft file: %s", r.Path)
 			continue
 		}
 
-		// Process the path to make it relative to the root
-		// The path from the server includes the root prefix, we need to remove it
+		// Make path relative to f.root
 		entryPath := r.Path
 		if strings.HasPrefix(entryPath, "/") {
 			entryPath = entryPath[1:]
 		}
-
-		// Strip the root prefix if needed
 		if f.root != "" {
 			if !strings.HasPrefix(entryPath, f.root) {
 				fs.Debugf(f, "Path %s doesn't have root prefix %s, skipping", entryPath, f.root)
 				continue
 			}
-			entryPath = entryPath[len(f.root):]
+			entryPath = strings.TrimPrefix(entryPath, f.root)
 			if strings.HasPrefix(entryPath, "/") {
 				entryPath = entryPath[1:]
-			}
-		}
-
-		// If the path from the listdir API includes the directory we're listing, strip it
-		if dir != "" && strings.HasPrefix(entryPath, dir) {
-			prefix := dir
-			if !strings.HasSuffix(prefix, "/") {
-				prefix += "/"
-			}
-			if strings.HasPrefix(entryPath, prefix) {
-				entryPath = entryPath[len(prefix):]
 			}
 		}
 
@@ -337,14 +325,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 				size:   r.Size,
 			})
 		} else if r.Type == "tree" {
-			entries = append(entries, &Directory{
-				Object: Object{
-					fs:     f,
-					remote: entryPath,
-					mtime:  r.Mtime,
-					size:   r.Size,
-				},
-			})
+			dirEntry := &Directory{
+				fs:     f,
+				remote: entryPath,
+				mtime:  r.Mtime,
+				size:   r.Size, // Typically 0 for directories
+			}
+			entries = append(entries, dirEntry)
 		} else {
 			fs.Debugf(f, "Unknown entry type: %s for path: %s", r.Type, entryPath)
 		}
@@ -406,48 +393,12 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // Mkdir creates a directory
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	fs.Debugf(f, "Making directory: %s", dir)
-
-	encodedPath := f.buildFullPath(dir)
-	res, err := f.callAPI(ctx, "POST", fmt.Sprintf("/%s/fs/mkdir?path=%s", f.drive, encodedPath), nil)
-	if err != nil {
-		return err
-	}
-	defer fs.CheckClose(res.Body, &err) // Ensure body is closed
-
-	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
-		return fmt.Errorf("mkdir failed with status code: %d", res.StatusCode)
-	}
-	return nil
+	return fs.ErrorNotImplemented
 }
 
 // Rmdir removes a directory
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	fs.Debugf(f, "Removing directory: %s", dir)
-
-	// First, check if the directory is empty
-	entries, err := f.List(ctx, dir)
-	if err != nil {
-		return err
-	}
-
-	if len(entries) > 0 {
-		return fs.ErrorDirectoryNotEmpty
-	}
-
-	encodedPath := f.buildFullPath(dir)
-	fs.Debugf(f, "Encoded path for delete: %s", encodedPath)
-
-	res, err := f.callAPI(ctx, "POST", fmt.Sprintf("/%s/fs/delete?path=%s", f.drive, encodedPath), nil)
-	if err != nil {
-		return err
-	}
-	defer fs.CheckClose(res.Body, &err) // Ensure body is closed
-
-	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
-		return fmt.Errorf("rmdir failed with status code: %d", res.StatusCode)
-	}
-	return nil
+	return fs.ErrorNotImplemented
 }
 
 // -------------------------------------------------
@@ -524,6 +475,11 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.Debugf(o.fs, "Opening file: %s", o.remote)
+
+	if o.Size() == 0 && filepath.Ext(o.remote) == "" { // Heuristic for directories
+		fs.Debugf(o.fs, "Attempted to open directory as file: %s", o.remote)
+		return nil, fs.ErrorIsDir
+	}
 
 	token, err := o.fs.getShadeToken(ctx)
 	if err != nil {
@@ -741,14 +697,59 @@ func (f *Fs) callAPI(ctx context.Context, method, path string, response interfac
 // Directory implementation
 // -------------------------------------------------
 
-// Items returns the count of items in this directory
+// Remote returns the remote path
+func (d *Directory) Remote() string {
+	return d.remote
+}
+
+// ModTime returns the modification time
+func (d *Directory) ModTime(ctx context.Context) time.Time {
+	return time.Unix(0, d.mtime*int64(time.Millisecond))
+}
+
+// Size returns the size (0 for directories)
+func (d *Directory) Size() int64 {
+	return d.size
+}
+
+// Fs returns the filesystem info
+func (d *Directory) Fs() fs.Info {
+	return d.fs
+}
+
+// Hash is unsupported for directories
+func (d *Directory) Hash(ctx context.Context, t hash.Type) (string, error) {
+	return "", hash.ErrUnsupported
+}
+
+// SetModTime is unsupported for directories
+func (d *Directory) SetModTime(ctx context.Context, t time.Time) error {
+	return fs.ErrorCantSetModTime
+}
+
+// Storable indicates directories aren’t storable as files
+func (d *Directory) Storable() bool {
+	return false
+}
+
+// Open returns an error for directories
+func (d *Directory) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	fs.Debugf(d.fs, "Attempted to open directory: %s", d.remote)
+	return nil, fs.ErrorIsDir
+}
+
+// Items returns the number of items in the directory (-1 if unknown)
 func (d *Directory) Items() int64 {
 	return -1 // Unknown
 }
 
-// ID returns the ID of this directory if known, or "" otherwise
+// ID returns the directory ID (empty if not applicable)
 func (d *Directory) ID() string {
-	return "" // No specific ID
+	return ""
+}
+
+func (d *Directory) String() string {
+	return fmt.Sprintf("Directory: %s", d.remote)
 }
 
 // -------------------------------------------------
