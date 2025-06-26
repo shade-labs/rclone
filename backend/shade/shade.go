@@ -26,8 +26,8 @@ import (
 )
 
 const (
-	defaultEndpoint = "http://localhost:8001" // Default local development endpoint
-	apiEndpoint     = "http://localhost:9082" // API endpoint for getting tokens
+	defaultEndpoint = "https://fs.shade.inc"  // Default local development endpoint
+	apiEndpoint     = "https://api.shade.inc" // API endpoint for getting tokens
 	minSleep        = 10 * time.Millisecond   // Minimum sleep time for the pacer
 	maxSleep        = 5 * time.Minute         // Maximum sleep time for the pacer
 	decayConstant   = 1                       // Bigger for slower decay, exponential
@@ -268,10 +268,6 @@ func (f *Fs) getShadeToken(ctx context.Context) (string, error) {
 
 // List the objects and directories in dir into entries
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	if filepath.Ext(dir) != "" {
-		fs.Debugf(f, "Path appears to be a file, not a directory: %s", dir)
-		return nil, fs.ErrorNotImplemented
-	}
 
 	encodedPath := f.buildFullPath(dir)
 
