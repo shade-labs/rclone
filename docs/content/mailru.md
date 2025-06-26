@@ -35,6 +35,7 @@ give an error like `oauth2: server response missing access_token`.
 - Go to Security / "Пароль и безопасность"
 - Click password for apps / "Пароли для внешних приложений"
 - Add the password - give it a name - eg "rclone"
+- Select the permissions level. For some reason just "Full access to Cloud" (WebDav) doesn't work for Rclone currently. You have to select "Full access to Mail, Cloud and Calendar" (all protocols). ([thread on forum.rclone.org](https://forum.rclone.org/t/failed-to-create-file-system-for-mailru-failed-to-authorize-oauth2-invalid-username-or-password-username-or-password-is-incorrect/49298))
 - Copy the password and use this password below - your normal login password won't work.
 
 Now run
@@ -292,6 +293,19 @@ Properties:
 - Env Var:     RCLONE_MAILRU_TOKEN_URL
 - Type:        string
 - Required:    false
+
+#### --mailru-client-credentials
+
+Use client credentials OAuth flow.
+
+This will use the OAUTH2 client Credentials Flow as described in RFC 6749.
+
+Properties:
+
+- Config:      client_credentials
+- Env Var:     RCLONE_MAILRU_CLIENT_CREDENTIALS
+- Type:        bool
+- Default:     false
 
 #### --mailru-speedup-file-patterns
 

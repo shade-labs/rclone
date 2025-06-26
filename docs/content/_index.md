@@ -116,6 +116,7 @@ WebDAV or S3, that work out of the box.)
 {{< provider name="Arvan Cloud Object Storage (AOS)" home="https://www.arvancloud.ir/en/products/cloud-storage" config="/s3/#arvan-cloud-object-storage-aos" >}}
 {{< provider name="Citrix ShareFile" home="http://sharefile.com/" config="/sharefile/" >}}
 {{< provider name="Cloudflare R2" home="https://blog.cloudflare.com/r2-open-beta/" config="/s3/#cloudflare-r2" >}}
+{{< provider name="Cloudinary" home="https://cloudinary.com/" config="/cloudinary/" >}}
 {{< provider name="DigitalOcean Spaces" home="https://www.digitalocean.com/products/object-storage/" config="/s3/#digitalocean-spaces" >}}
 {{< provider name="Digi Storage" home="https://storage.rcs-rds.ro/" config="/koofr/#digi-storage" >}}
 {{< provider name="Dreamhost" home="https://www.dreamhost.com/cloud/storage/" config="/s3/#dreamhost" >}}
@@ -123,6 +124,8 @@ WebDAV or S3, that work out of the box.)
 {{< provider name="Enterprise File Fabric" home="https://storagemadeeasy.com/about/" config="/filefabric/" >}}
 {{< provider name="Fastmail Files" home="https://www.fastmail.com/" config="/webdav/#fastmail-files" >}}
 {{< provider name="Files.com" home="https://www.files.com/" config="/filescom/" >}}
+{{< provider name="FileLu Cloud Storage" home="https://filelu.com/" config="/filelu/" >}}
+{{< provider name="FlashBlade" home="https://www.purestorage.com/products/unstructured-data-storage.html" config="/s3/#pure-storage-flashblade" >}}
 {{< provider name="FTP" home="https://en.wikipedia.org/wiki/File_Transfer_Protocol" config="/ftp/" >}}
 {{< provider name="Gofile" home="https://gofile.io/" config="/gofile/" >}}
 {{< provider name="Google Cloud Storage" home="https://cloud.google.com/storage/" config="/googlecloudstorage/" >}}
@@ -147,7 +150,8 @@ WebDAV or S3, that work out of the box.)
 {{< provider name="Magalu" home="https://magalu.cloud/object-storage/" config="/s3/#magalu" >}}
 {{< provider name="Mail.ru Cloud" home="https://cloud.mail.ru/" config="/mailru/" >}}
 {{< provider name="Memset Memstore" home="https://www.memset.com/cloud/storage/" config="/swift/" >}}
-{{< provider name="Mega" home="https://mega.nz/" config="/mega/" >}}
+{{< provider name="MEGA" home="https://mega.nz/" config="/mega/" >}}
+{{< provider name="MEGA S4" home="https://mega.io/objectstorage" config="/s3/#mega" >}}
 {{< provider name="Memory" home="/memory/" config="/memory/" >}}
 {{< provider name="Microsoft Azure Blob Storage" home="https://azure.microsoft.com/en-us/services/storage/blobs/" config="/azureblob/" >}}
 {{< provider name="Microsoft Azure Files Storage" home="https://azure.microsoft.com/en-us/services/storage/files/" config="/azurefiles/" >}}

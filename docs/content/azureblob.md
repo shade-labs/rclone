@@ -540,6 +540,28 @@ Properties:
 - Type:        string
 - Required:    false
 
+#### --azureblob-disable-instance-discovery
+
+Skip requesting Microsoft Entra instance metadata
+
+This should be set true only by applications authenticating in
+disconnected clouds, or private clouds such as Azure Stack.
+
+It determines whether rclone requests Microsoft Entra instance
+metadata from `https://login.microsoft.com/` before
+authenticating.
+
+Setting this to true will skip this request, making you responsible
+for ensuring the configured authority is valid and trustworthy.
+
+
+Properties:
+
+- Config:      disable_instance_discovery
+- Env Var:     RCLONE_AZUREBLOB_DISABLE_INSTANCE_DISCOVERY
+- Type:        bool
+- Default:     false
+
 #### --azureblob-use-msi
 
 Use a managed service identity to authenticate (only works in Azure).
@@ -612,6 +634,26 @@ Properties:
 - Type:        bool
 - Default:     false
 
+#### --azureblob-use-az
+
+Use Azure CLI tool az for authentication
+
+Set to use the [Azure CLI tool az](https://learn.microsoft.com/en-us/cli/azure/)
+as the sole means of authentication.
+
+Setting this can be useful if you wish to use the az CLI on a host with
+a System Managed Identity that you do not want to use.
+
+Don't set env_auth at the same time.
+
+
+Properties:
+
+- Config:      use_az
+- Env Var:     RCLONE_AZUREBLOB_USE_AZ
+- Type:        bool
+- Default:     false
+
 #### --azureblob-endpoint
 
 Endpoint for the service.
@@ -676,6 +718,65 @@ Properties:
 - Env Var:     RCLONE_AZUREBLOB_UPLOAD_CONCURRENCY
 - Type:        int
 - Default:     16
+
+#### --azureblob-copy-cutoff
+
+Cutoff for switching to multipart copy.
+
+Any files larger than this that need to be server-side copied will be
+copied in chunks of chunk_size using the put block list API.
+
+Files smaller than this limit will be copied with the Copy Blob API.
+
+Properties:
+
+- Config:      copy_cutoff
+- Env Var:     RCLONE_AZUREBLOB_COPY_CUTOFF
+- Type:        SizeSuffix
+- Default:     8Mi
+
+#### --azureblob-copy-concurrency
+
+Concurrency for multipart copy.
+
+This is the number of chunks of the same file that are copied
+concurrently.
+
+These chunks are not buffered in memory and Microsoft recommends
+setting this value to greater than 1000 in the azcopy documentation.
+
+https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azcopy-optimize#increase-concurrency
+
+In tests, copy speed increases almost linearly with copy
+concurrency.
+
+Properties:
+
+- Config:      copy_concurrency
+- Env Var:     RCLONE_AZUREBLOB_COPY_CONCURRENCY
+- Type:        int
+- Default:     512
+
+#### --azureblob-use-copy-blob
+
+Whether to use the Copy Blob API when copying to the same storage account.
+
+If true (the default) then rclone will use the Copy Blob API for
+copies to the same storage account even when the size is above the
+copy_cutoff.
+
+Rclone assumes that the same storage account means the same config
+and does not check for the same storage account in different configs.
+
+There should be no need to change this value.
+
+
+Properties:
+
+- Config:      use_copy_blob
+- Env Var:     RCLONE_AZUREBLOB_USE_COPY_BLOB
+- Type:        bool
+- Default:     true
 
 #### --azureblob-list-chunk
 
@@ -896,8 +997,9 @@ You can set custom upload headers with the `--header-upload` flag.
 - Content-Encoding
 - Content-Language
 - Content-Type
+- X-MS-Tags
 
-Eg `--header-upload "Content-Type: text/potato"`
+Eg `--header-upload "Content-Type: text/potato"` or `--header-upload "X-MS-Tags: foo=bar"`
 
 ## Limitations
 

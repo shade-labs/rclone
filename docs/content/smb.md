@@ -8,7 +8,7 @@ versionIntroduced: "v1.60"
 
 SMB is [a communication protocol to share files over network](https://en.wikipedia.org/wiki/Server_Message_Block).
 
-This relies on [go-smb2 library](https://github.com/hirochachacha/go-smb2/) for communication with SMB protocol.
+This relies on [go-smb2 library](https://github.com/CloudSoda/go-smb2/) for communication with SMB protocol.
 
 Paths are specified as `remote:sharename` (or `remote:` for the `lsd`
 command.)  You may put subdirectories in too, e.g. `remote:item/path/to/dir`.
@@ -189,6 +189,23 @@ Properties:
 - Env Var:     RCLONE_SMB_SPN
 - Type:        string
 - Required:    false
+
+#### --smb-use-kerberos
+
+Use Kerberos authentication.
+
+If set, rclone will use Kerberos authentication instead of NTLM. This
+requires a valid Kerberos configuration and credentials cache to be
+available, either in the default locations or as specified by the
+KRB5_CONFIG and KRB5CCNAME environment variables.
+
+
+Properties:
+
+- Config:      use_kerberos
+- Env Var:     RCLONE_SMB_USE_KERBEROS
+- Type:        bool
+- Default:     false
 
 ### Advanced options
 

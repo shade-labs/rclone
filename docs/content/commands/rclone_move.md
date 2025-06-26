@@ -81,6 +81,7 @@ Flags for anything which can copy a file
   -I, --ignore-times                                Don't skip items that match size and time - transfer all unconditionally
       --immutable                                   Do not modify files, fail if existing files have been modified
       --inplace                                     Download directly to destination file instead of atomic download to temp/rename
+  -l, --links                                       Translate symlinks to/from regular files with a '.rclonelink' extension
       --max-backlog int                             Maximum number of objects in sync or check backlog (default 10000)
       --max-duration Duration                       Maximum duration rclone will transfer data for (default 0s)
       --max-transfer SizeSuffix                     Maximum size of data to transfer (default off)
@@ -90,6 +91,7 @@ Flags for anything which can copy a file
       --multi-thread-cutoff SizeSuffix              Use multi-thread downloads for files above this size (default 256Mi)
       --multi-thread-streams int                    Number of streams to use for multi-thread downloads (default 4)
       --multi-thread-write-buffer-size SizeSuffix   In memory buffer size for writing when in multi-thread mode (default 128Ki)
+      --name-transform stringArray                  Transform paths during the copy process
       --no-check-dest                               Don't check the destination, copy regardless
       --no-traverse                                 Don't traverse destination file system on copy
       --no-update-dir-modtime                       Don't update directory modification times
@@ -126,6 +128,7 @@ Flags for filtering directory listings
       --files-from-raw stringArray          Read list of source-file names from file without any processing of lines (use - to read from stdin)
   -f, --filter stringArray                  Add a file filtering rule
       --filter-from stringArray             Read file filtering patterns from a file (use - to read from stdin)
+      --hash-filter string                  Partition filenames by hash k/n or randomly @/n
       --ignore-case                         Ignore case in filters (case insensitive)
       --include stringArray                 Include files matching pattern
       --include-from stringArray            Read file include patterns from file (use - to read from stdin)
