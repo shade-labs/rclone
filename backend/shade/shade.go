@@ -690,27 +690,17 @@ func (h *hashingReadCloser) Close() error {
 	return h.closer.Close()
 }
 
-// Update updates the object with the contents of the io.Reader
+
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	fs.Debugf(o.fs, "Uploading file: %s", o.remote)
 
 	size := src.Size()
 	
-	// Build full path for upload
 	fullPath := o.remote
 	if o.fs.root != "" {
 		fullPath = path.Join(o.fs.root, o.remote)
 	}
 
-	// Use configured chunk size as threshold for single vs multipart upload
-	chunkSize := int64(o.fs.opt.ChunkSize)
-	
-	// For small files (< chunk size), use single upload
-	if size < chunkSize && size >= 0 {
-		return o.uploadSingle(ctx, in, fullPath, size)
-	}
-
-	// For larger files or unknown size, use multipart upload
 	return o.uploadMultipart(ctx, in, fullPath, size)
 }
 
