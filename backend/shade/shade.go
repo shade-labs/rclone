@@ -3,6 +3,7 @@
 package shade
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -32,6 +33,9 @@ const (
 	maxSleep        = 5 * time.Minute         // Maximum sleep time for the pacer
 	decayConstant   = 1                       // Bigger for slower decay, exponential
 	tokenTTL        = 5 * time.Minute         // Token expires in 5 mins, refresh after 4
+	defaultChunkSize = 64 * 1024 * 1024       // Default chunk size (64MB)
+	minChunkSize    = 5 * 1024 * 1024         // Minimum chunk size (5MB) - S3 requirement
+	maxChunkSize    = 5 * 1024 * 1024 * 1024  // Maximum chunk size (5GB)
 )
 
 // Register with Fs
@@ -60,6 +64,11 @@ func init() {
 			Help:     "Endpoint for the service.\n\nLeave blank normally.",
 			Advanced: true,
 		}, {
+			Name:     "chunk_size",
+			Help:     "Chunk size to use for uploading.\n\nAny files larger than this will be uploaded in chunks of this size.\n\nNote that this is stored in memory per transfer, so increasing it will\nincrease memory usage.\n\nMinimum is 5MB, maximum is 5GB.",
+			Default:  fs.SizeSuffix(defaultChunkSize),
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -72,10 +81,11 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Drive    string `config:"drive_id"`
-	ApiKey   string `config:"api_key"`
-	Endpoint string `config:"endpoint"`
-	Encoding encoder.MultiEncoder
+	Drive     string               `config:"drive_id"`
+	ApiKey    string               `config:"api_key"`
+	Endpoint  string               `config:"endpoint"`
+	ChunkSize fs.SizeSuffix        `config:"chunk_size"`
+	Encoding  encoder.MultiEncoder
 }
 
 // Fs represents a shade remote
@@ -152,6 +162,16 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	} else {
 		f.endpoint = opt.Endpoint
 	}
+
+	// Validate and set chunk size
+	if opt.ChunkSize == 0 {
+		opt.ChunkSize = fs.SizeSuffix(defaultChunkSize)
+	} else if opt.ChunkSize < fs.SizeSuffix(minChunkSize) {
+		return nil, fmt.Errorf("chunk_size %d is less than minimum %d", opt.ChunkSize, minChunkSize)
+	} else if opt.ChunkSize > fs.SizeSuffix(maxChunkSize) {
+		return nil, fmt.Errorf("chunk_size %d is greater than maximum %d", opt.ChunkSize, maxChunkSize)
+	}
+	fs.Debugf(f, "Using chunk size: %d bytes", opt.ChunkSize)
 
 	// Ensure root doesn't have trailing slash
 	f.root = strings.Trim(f.root, "/")
@@ -382,19 +402,61 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 // Put uploads a file
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Currently not implementing upload functionality
-	// This will be part of future enhancements
-	return nil, fs.ErrorNotImplemented
+	// Create temporary object
+	o := &Object{
+		fs:     f,
+		remote: src.Remote(),
+	}
+	return o, o.Update(ctx, in, src, options...)
 }
 
 // Mkdir creates a directory
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	return fs.ErrorNotImplemented
+	fs.Debugf(f, "Creating directory: %s", dir)
+
+	encodedPath := f.buildFullPath(dir)
+	fs.Debugf(f, "Encoded path for mkdir: %s", encodedPath)
+
+	res, err := f.callAPI(ctx, "POST", fmt.Sprintf("/%s/fs/mkdir?path=%s", f.drive, encodedPath), nil)
+	if err != nil {
+		fs.Debugf(f, "Error creating directory: %v", err)
+		return err
+	}
+	defer fs.CheckClose(res.Body, &err)
+
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
+		return fmt.Errorf("mkdir failed with status code: %d", res.StatusCode)
+	}
+
+	fs.Debugf(f, "Successfully created directory: %s", dir)
+	return nil
 }
 
 // Rmdir removes a directory
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	return fs.ErrorNotImplemented
+	fs.Debugf(f, "Removing directory: %s", dir)
+
+	encodedPath := f.buildFullPath(dir)
+	fs.Debugf(f, "Encoded path for rmdir: %s", encodedPath)
+
+	// Use the delete endpoint which handles both files and directories
+	res, err := f.callAPI(ctx, "POST", fmt.Sprintf("/%s/fs/delete?path=%s", f.drive, encodedPath), nil)
+	if err != nil {
+		fs.Debugf(f, "Error removing directory: %v", err)
+		return err
+	}
+	defer fs.CheckClose(res.Body, &err)
+
+	if res.StatusCode == http.StatusNotFound {
+		return fs.ErrorDirNotFound
+	}
+
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
+		return fmt.Errorf("rmdir failed with status code: %d", res.StatusCode)
+	}
+
+	fs.Debugf(f, "Successfully removed directory: %s", dir)
+	return nil
 }
 
 // -------------------------------------------------
@@ -630,9 +692,26 @@ func (h *hashingReadCloser) Close() error {
 
 // Update updates the object with the contents of the io.Reader
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	// Currently not implementing upload functionality
-	// This will be part of future enhancements
-	return fs.ErrorNotImplemented
+	fs.Debugf(o.fs, "Uploading file: %s", o.remote)
+
+	size := src.Size()
+	
+	// Build full path for upload
+	fullPath := o.remote
+	if o.fs.root != "" {
+		fullPath = path.Join(o.fs.root, o.remote)
+	}
+
+	// Use configured chunk size as threshold for single vs multipart upload
+	chunkSize := int64(o.fs.opt.ChunkSize)
+	
+	// For small files (< chunk size), use single upload
+	if size < chunkSize && size >= 0 {
+		return o.uploadSingle(ctx, in, fullPath, size)
+	}
+
+	// For larger files or unknown size, use multipart upload
+	return o.uploadMultipart(ctx, in, fullPath, size)
 }
 
 // Remove removes the object
@@ -746,6 +825,329 @@ func (d *Directory) ID() string {
 
 func (d *Directory) String() string {
 	return fmt.Sprintf("Directory: %s", d.remote)
+}
+
+// uploadSingle handles single-part upload for smaller files
+func (o *Object) uploadSingle(ctx context.Context, in io.Reader, fullPath string, size int64) error {
+	// Get upload token
+	token, err := o.fs.getShadeToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get token: %w", err)
+	}
+
+	// Request presigned URL
+	type uploadRequest struct {
+		Path string `json:"path"`
+	}
+	reqBody := uploadRequest{Path: fullPath}
+	
+	var uploadResp struct {
+		URL    string            `json:"url"`
+		Headers map[string]string `json:"headers,omitempty"`
+		Token  string            `json:"token"`
+	}
+	
+	opts := rest.Opts{
+		Method:  "POST",
+		Path:    fmt.Sprintf("/%s/upload", o.fs.drive),
+		RootURL: o.fs.endpoint,
+		ExtraHeaders: map[string]string{
+			"Authorization": "Bearer " + token,
+		},
+	}
+	
+	err = o.fs.pacer.Call(func() (bool, error) {
+		res, err := o.fs.srv.CallJSON(ctx, &opts, reqBody, &uploadResp)
+		if err != nil {
+			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
+		}
+		return false, nil
+	})
+	
+	if err != nil {
+		return fmt.Errorf("failed to get upload URL: %w", err)
+	}
+
+	// Upload to presigned URL
+	req, err := http.NewRequestWithContext(ctx, "PUT", uploadResp.URL, in)
+	if err != nil {
+		return fmt.Errorf("failed to create upload request: %w", err)
+	}
+	
+	// Add any additional headers
+	for k, v := range uploadResp.Headers {
+		req.Header.Set(k, v)
+	}
+	
+	if size >= 0 {
+		req.ContentLength = size
+	}
+	
+	// Perform upload
+	client := &http.Client{}
+	uploadRes, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to upload: %w", err)
+	}
+	defer fs.CheckClose(uploadRes.Body, &err)
+	
+	if uploadRes.StatusCode != http.StatusOK && uploadRes.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(uploadRes.Body)
+		return fmt.Errorf("upload failed with status %d: %s", uploadRes.StatusCode, string(body))
+	}
+
+	// Complete the upload
+	completeOpts := rest.Opts{
+		Method:  "POST",
+		Path:    fmt.Sprintf("/%s/upload/complete?token=%s", o.fs.drive, url.QueryEscape(uploadResp.Token)),
+		RootURL: o.fs.endpoint,
+		ExtraHeaders: map[string]string{
+			"Authorization": "Bearer " + token,
+		},
+	}
+	
+	err = o.fs.pacer.Call(func() (bool, error) {
+		res, err := o.fs.srv.Call(ctx, &completeOpts)
+		if err != nil {
+			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
+		}
+		if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(res.Body)
+			return false, fmt.Errorf("complete failed with status %d: %s", res.StatusCode, string(body))
+		}
+		return false, nil
+	})
+	
+	if err != nil {
+		return fmt.Errorf("failed to complete upload: %w", err)
+	}
+
+	// Update object metadata
+	o.size = size
+	o.mtime = time.Now().UnixMilli()
+	
+	fs.Debugf(o.fs, "Successfully uploaded file: %s", o.remote)
+	return nil
+}
+
+// uploadMultipart handles multipart upload for larger files
+func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath string, size int64) error {
+	// Use configured chunk size
+	chunkSize := int64(o.fs.opt.ChunkSize)
+	
+	// Get upload token
+	token, err := o.fs.getShadeToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get token: %w", err)
+	}
+
+	// Initiate multipart upload
+	type initRequest struct {
+		Path     string `json:"path"`
+		PartSize int64  `json:"partSize"`
+	}
+	reqBody := initRequest{
+		Path:     fullPath,
+		PartSize: chunkSize,
+	}
+	
+	var initResp struct {
+		Token string `json:"token"`
+	}
+	
+	opts := rest.Opts{
+		Method:  "POST",
+		Path:    fmt.Sprintf("/%s/upload/multipart", o.fs.drive),
+		RootURL: o.fs.endpoint,
+		ExtraHeaders: map[string]string{
+			"Authorization": "Bearer " + token,
+		},
+	}
+	
+	err = o.fs.pacer.Call(func() (bool, error) {
+		res, err := o.fs.srv.CallJSON(ctx, &opts, reqBody, &initResp)
+		if err != nil {
+			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
+		}
+		return false, nil
+	})
+	
+	if err != nil {
+		return fmt.Errorf("failed to initiate multipart upload: %w", err)
+	}
+
+	// Upload parts
+	var parts []struct {
+		PartNumber int    `json:"PartNumber"`
+		ETag       string `json:"ETag"`
+	}
+	
+	partNumber := 1
+	for {
+		// Read chunk
+		chunk := make([]byte, chunkSize)
+		n, err := io.ReadFull(in, chunk)
+		if n == 0 && err == io.EOF {
+			break
+		}
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			// Abort upload on error
+			o.abortMultipartUpload(ctx, initResp.Token)
+			return fmt.Errorf("failed to read chunk: %w", err)
+		}
+		chunk = chunk[:n]
+
+		// Get presigned URL for this part
+		var partURLs []struct {
+			URL     string            `json:"url"`
+			Headers map[string]string `json:"headers,omitempty"`
+		}
+		
+		partOpts := rest.Opts{
+			Method:  "POST",
+			Path:    fmt.Sprintf("/%s/upload/multipart/part/%d?token=%s", o.fs.drive, partNumber, url.QueryEscape(initResp.Token)),
+			RootURL: o.fs.endpoint,
+			ExtraHeaders: map[string]string{
+				"Authorization": "Bearer " + token,
+			},
+		}
+		
+		err = o.fs.pacer.Call(func() (bool, error) {
+			res, err := o.fs.srv.CallJSON(ctx, &partOpts, nil, &partURLs)
+			if err != nil {
+				return res != nil && res.StatusCode == http.StatusTooManyRequests, err
+			}
+			return false, nil
+		})
+		
+		if err != nil {
+			o.abortMultipartUpload(ctx, initResp.Token)
+			return fmt.Errorf("failed to get part URL: %w", err)
+		}
+
+		if len(partURLs) == 0 {
+			o.abortMultipartUpload(ctx, initResp.Token)
+			return fmt.Errorf("no upload URLs returned")
+		}
+
+		// Upload chunk to first URL
+		uploadURL := partURLs[0]
+		req, err := http.NewRequestWithContext(ctx, "PUT", uploadURL.URL, bytes.NewReader(chunk))
+		if err != nil {
+			o.abortMultipartUpload(ctx, initResp.Token)
+			return fmt.Errorf("failed to create part upload request: %w", err)
+		}
+		
+		// Add headers
+		for k, v := range uploadURL.Headers {
+			req.Header.Set(k, v)
+		}
+		req.ContentLength = int64(n)
+		
+		client := &http.Client{}
+		uploadRes, err := client.Do(req)
+		if err != nil {
+			o.abortMultipartUpload(ctx, initResp.Token)
+			return fmt.Errorf("failed to upload part %d: %w", partNumber, err)
+		}
+		
+		if uploadRes.StatusCode != http.StatusOK && uploadRes.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(uploadRes.Body)
+			fs.CheckClose(uploadRes.Body, &err)
+			o.abortMultipartUpload(ctx, initResp.Token)
+			return fmt.Errorf("part upload failed with status %d: %s", uploadRes.StatusCode, string(body))
+		}
+		
+		// Get ETag from response
+		etag := uploadRes.Header.Get("ETag")
+		fs.CheckClose(uploadRes.Body, &err)
+		
+		parts = append(parts, struct {
+			PartNumber int    `json:"PartNumber"`
+			ETag       string `json:"ETag"`
+		}{
+			PartNumber: partNumber,
+			ETag:       etag,
+		})
+		
+		partNumber++
+		
+		// Break if we've read all data
+		if n < chunkSize {
+			break
+		}
+	}
+
+	// Complete multipart upload
+	type completeRequest struct {
+		Parts []struct {
+			PartNumber int    `json:"PartNumber"`
+			ETag       string `json:"ETag"`
+		} `json:"parts"`
+	}
+	completeBody := completeRequest{Parts: parts}
+	
+	completeOpts := rest.Opts{
+		Method:  "POST",
+		Path:    fmt.Sprintf("/%s/upload/multipart/complete?token=%s", o.fs.drive, url.QueryEscape(initResp.Token)),
+		RootURL: o.fs.endpoint,
+		ExtraHeaders: map[string]string{
+			"Authorization": "Bearer " + token,
+		},
+	}
+	
+	err = o.fs.pacer.Call(func() (bool, error) {
+		res, err := o.fs.srv.CallJSON(ctx, &completeOpts, completeBody, nil)
+		if err != nil {
+			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
+		}
+		if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(res.Body)
+			return false, fmt.Errorf("complete multipart failed with status %d: %s", res.StatusCode, string(body))
+		}
+		return false, nil
+	})
+	
+	if err != nil {
+		return fmt.Errorf("failed to complete multipart upload: %w", err)
+	}
+
+	// Update object metadata
+	o.size = size
+	o.mtime = time.Now().UnixMilli()
+	
+	fs.Debugf(o.fs, "Successfully uploaded file via multipart: %s", o.remote)
+	return nil
+}
+
+// abortMultipartUpload aborts a multipart upload
+func (o *Object) abortMultipartUpload(ctx context.Context, uploadToken string) {
+	token, err := o.fs.getShadeToken(ctx)
+	if err != nil {
+		fs.Debugf(o.fs, "Failed to get token for abort: %v", err)
+		return
+	}
+
+	opts := rest.Opts{
+		Method:  "POST",
+		Path:    fmt.Sprintf("/%s/upload/abort/multipart?token=%s", o.fs.drive, url.QueryEscape(uploadToken)),
+		RootURL: o.fs.endpoint,
+		ExtraHeaders: map[string]string{
+			"Authorization": "Bearer " + token,
+		},
+	}
+	
+	_ = o.fs.pacer.Call(func() (bool, error) {
+		res, err := o.fs.srv.Call(ctx, &opts)
+		if err != nil {
+			fs.Debugf(o.fs, "Failed to abort multipart upload: %v", err)
+			return false, nil // Don't retry abort
+		}
+		if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
+			fs.Debugf(o.fs, "Abort returned status %d", res.StatusCode)
+		}
+		return false, nil
+	})
 }
 
 // -------------------------------------------------
