@@ -1063,7 +1063,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 		partNumber++
 		
 		// Break if we've read all data
-		if n < chunkSize {
+		if int64(n) < chunkSize {
 			break
 		}
 	}
