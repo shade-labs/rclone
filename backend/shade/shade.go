@@ -27,15 +27,15 @@ import (
 )
 
 const (
-	defaultEndpoint = "https://fs.shade.inc"  // Default local development endpoint
-	apiEndpoint     = "https://api.shade.inc" // API endpoint for getting tokens
-	minSleep        = 10 * time.Millisecond   // Minimum sleep time for the pacer
-	maxSleep        = 5 * time.Minute         // Maximum sleep time for the pacer
-	decayConstant   = 1                       // Bigger for slower decay, exponential
-	tokenTTL        = 5 * time.Minute         // Token expires in 5 mins, refresh after 4
-	defaultChunkSize = 64 * 1024 * 1024       // Default chunk size (64MB)
-	minChunkSize    = 5 * 1024 * 1024         // Minimum chunk size (5MB) - S3 requirement
-	maxChunkSize    = 5 * 1024 * 1024 * 1024  // Maximum chunk size (5GB)
+	defaultEndpoint  = "https://fs.shade.inc"  // Default local development endpoint
+	apiEndpoint      = "https://api.shade.inc" // API endpoint for getting tokens
+	minSleep         = 10 * time.Millisecond   // Minimum sleep time for the pacer
+	maxSleep         = 5 * time.Minute         // Maximum sleep time for the pacer
+	decayConstant    = 1                       // Bigger for slower decay, exponential
+	tokenTTL         = 5 * time.Minute         // Token expires in 5 mins, refresh after 4
+	defaultChunkSize = 64 * 1024 * 1024        // Default chunk size (64MB)
+	minChunkSize     = 5 * 1024 * 1024         // Minimum chunk size (5MB) - S3 requirement
+	maxChunkSize     = 5 * 1024 * 1024 * 1024  // Maximum chunk size (5GB)
 )
 
 // Register with Fs
@@ -81,10 +81,10 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Drive     string               `config:"drive_id"`
-	ApiKey    string               `config:"api_key"`
-	Endpoint  string               `config:"endpoint"`
-	ChunkSize fs.SizeSuffix        `config:"chunk_size"`
+	Drive     string        `config:"drive_id"`
+	ApiKey    string        `config:"api_key"`
+	Endpoint  string        `config:"endpoint"`
+	ChunkSize fs.SizeSuffix `config:"chunk_size"`
 	Encoding  encoder.MultiEncoder
 }
 
@@ -690,12 +690,11 @@ func (h *hashingReadCloser) Close() error {
 	return h.closer.Close()
 }
 
-
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	fs.Debugf(o.fs, "Uploading file: %s", o.remote)
 
 	size := src.Size()
-	
+
 	fullPath := o.remote
 	if o.fs.root != "" {
 		fullPath = path.Join(o.fs.root, o.remote)
@@ -830,13 +829,13 @@ func (o *Object) uploadSingle(ctx context.Context, in io.Reader, fullPath string
 		Path string `json:"path"`
 	}
 	reqBody := uploadRequest{Path: fullPath}
-	
+
 	var uploadResp struct {
-		URL    string            `json:"url"`
+		URL     string            `json:"url"`
 		Headers map[string]string `json:"headers,omitempty"`
-		Token  string            `json:"token"`
+		Token   string            `json:"token"`
 	}
-	
+
 	opts := rest.Opts{
 		Method:  "POST",
 		Path:    fmt.Sprintf("/%s/upload", o.fs.drive),
@@ -845,7 +844,7 @@ func (o *Object) uploadSingle(ctx context.Context, in io.Reader, fullPath string
 			"Authorization": "Bearer " + token,
 		},
 	}
-	
+
 	err = o.fs.pacer.Call(func() (bool, error) {
 		res, err := o.fs.srv.CallJSON(ctx, &opts, reqBody, &uploadResp)
 		if err != nil {
@@ -853,7 +852,7 @@ func (o *Object) uploadSingle(ctx context.Context, in io.Reader, fullPath string
 		}
 		return false, nil
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to get upload URL: %w", err)
 	}
@@ -863,16 +862,16 @@ func (o *Object) uploadSingle(ctx context.Context, in io.Reader, fullPath string
 	if err != nil {
 		return fmt.Errorf("failed to create upload request: %w", err)
 	}
-	
+
 	// Add any additional headers
 	for k, v := range uploadResp.Headers {
 		req.Header.Set(k, v)
 	}
-	
+
 	if size >= 0 {
 		req.ContentLength = size
 	}
-	
+
 	// Perform upload
 	client := &http.Client{}
 	uploadRes, err := client.Do(req)
@@ -880,7 +879,7 @@ func (o *Object) uploadSingle(ctx context.Context, in io.Reader, fullPath string
 		return fmt.Errorf("failed to upload: %w", err)
 	}
 	defer fs.CheckClose(uploadRes.Body, &err)
-	
+
 	if uploadRes.StatusCode != http.StatusOK && uploadRes.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(uploadRes.Body)
 		return fmt.Errorf("upload failed with status %d: %s", uploadRes.StatusCode, string(body))
@@ -895,7 +894,7 @@ func (o *Object) uploadSingle(ctx context.Context, in io.Reader, fullPath string
 			"Authorization": "Bearer " + token,
 		},
 	}
-	
+
 	err = o.fs.pacer.Call(func() (bool, error) {
 		res, err := o.fs.srv.Call(ctx, &completeOpts)
 		if err != nil {
@@ -907,7 +906,7 @@ func (o *Object) uploadSingle(ctx context.Context, in io.Reader, fullPath string
 		}
 		return false, nil
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to complete upload: %w", err)
 	}
@@ -915,7 +914,7 @@ func (o *Object) uploadSingle(ctx context.Context, in io.Reader, fullPath string
 	// Update object metadata
 	o.size = size
 	o.mtime = time.Now().UnixMilli()
-	
+
 	fs.Debugf(o.fs, "Successfully uploaded file: %s", o.remote)
 	return nil
 }
@@ -924,7 +923,7 @@ func (o *Object) uploadSingle(ctx context.Context, in io.Reader, fullPath string
 func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath string, size int64) error {
 	// Use configured chunk size
 	chunkSize := int64(o.fs.opt.ChunkSize)
-	
+
 	// Get upload token
 	token, err := o.fs.getShadeToken(ctx)
 	if err != nil {
@@ -940,11 +939,11 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 		Path:     fullPath,
 		PartSize: chunkSize,
 	}
-	
+
 	var initResp struct {
 		Token string `json:"token"`
 	}
-	
+
 	opts := rest.Opts{
 		Method:  "POST",
 		Path:    fmt.Sprintf("/%s/upload/multipart", o.fs.drive),
@@ -953,7 +952,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 			"Authorization": "Bearer " + token,
 		},
 	}
-	
+
 	err = o.fs.pacer.Call(func() (bool, error) {
 		res, err := o.fs.srv.CallJSON(ctx, &opts, reqBody, &initResp)
 		if err != nil {
@@ -961,7 +960,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 		}
 		return false, nil
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
@@ -971,7 +970,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 		PartNumber int    `json:"PartNumber"`
 		ETag       string `json:"ETag"`
 	}
-	
+
 	partNumber := 1
 	for {
 		// Read chunk
@@ -988,11 +987,11 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 		chunk = chunk[:n]
 
 		// Get presigned URL for this part
-		var partURLs []struct {
+		var partURL struct {
 			URL     string            `json:"url"`
 			Headers map[string]string `json:"headers,omitempty"`
 		}
-		
+
 		partOpts := rest.Opts{
 			Method:  "POST",
 			Path:    fmt.Sprintf("/%s/upload/multipart/part/%d?token=%s", o.fs.drive, partNumber, url.QueryEscape(initResp.Token)),
@@ -1001,57 +1000,52 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 				"Authorization": "Bearer " + token,
 			},
 		}
-		
+
 		err = o.fs.pacer.Call(func() (bool, error) {
-			res, err := o.fs.srv.CallJSON(ctx, &partOpts, nil, &partURLs)
+			res, err := o.fs.srv.CallJSON(ctx, &partOpts, nil, &partURL)
 			if err != nil {
 				return res != nil && res.StatusCode == http.StatusTooManyRequests, err
 			}
 			return false, nil
 		})
-		
+
 		if err != nil {
 			o.abortMultipartUpload(ctx, initResp.Token)
 			return fmt.Errorf("failed to get part URL: %w", err)
 		}
 
-		if len(partURLs) == 0 {
-			o.abortMultipartUpload(ctx, initResp.Token)
-			return fmt.Errorf("no upload URLs returned")
-		}
-
-		// Upload chunk to first URL
-		uploadURL := partURLs[0]
+		// Upload chunk to URL
+		uploadURL := partURL
 		req, err := http.NewRequestWithContext(ctx, "PUT", uploadURL.URL, bytes.NewReader(chunk))
 		if err != nil {
 			o.abortMultipartUpload(ctx, initResp.Token)
 			return fmt.Errorf("failed to create part upload request: %w", err)
 		}
-		
+
 		// Add headers
 		for k, v := range uploadURL.Headers {
 			req.Header.Set(k, v)
 		}
 		req.ContentLength = int64(n)
-		
+
 		client := &http.Client{}
 		uploadRes, err := client.Do(req)
 		if err != nil {
 			o.abortMultipartUpload(ctx, initResp.Token)
 			return fmt.Errorf("failed to upload part %d: %w", partNumber, err)
 		}
-		
+
 		if uploadRes.StatusCode != http.StatusOK && uploadRes.StatusCode != http.StatusCreated {
 			body, _ := io.ReadAll(uploadRes.Body)
 			fs.CheckClose(uploadRes.Body, &err)
 			o.abortMultipartUpload(ctx, initResp.Token)
 			return fmt.Errorf("part upload failed with status %d: %s", uploadRes.StatusCode, string(body))
 		}
-		
+
 		// Get ETag from response
 		etag := uploadRes.Header.Get("ETag")
 		fs.CheckClose(uploadRes.Body, &err)
-		
+
 		parts = append(parts, struct {
 			PartNumber int    `json:"PartNumber"`
 			ETag       string `json:"ETag"`
@@ -1059,9 +1053,9 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 			PartNumber: partNumber,
 			ETag:       etag,
 		})
-		
+
 		partNumber++
-		
+
 		// Break if we've read all data
 		if int64(n) < chunkSize {
 			break
@@ -1076,7 +1070,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 		} `json:"parts"`
 	}
 	completeBody := completeRequest{Parts: parts}
-	
+
 	completeOpts := rest.Opts{
 		Method:  "POST",
 		Path:    fmt.Sprintf("/%s/upload/multipart/complete?token=%s", o.fs.drive, url.QueryEscape(initResp.Token)),
@@ -1085,7 +1079,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 			"Authorization": "Bearer " + token,
 		},
 	}
-	
+
 	err = o.fs.pacer.Call(func() (bool, error) {
 		res, err := o.fs.srv.CallJSON(ctx, &completeOpts, completeBody, nil)
 		if err != nil {
@@ -1097,7 +1091,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 		}
 		return false, nil
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to complete multipart upload: %w", err)
 	}
@@ -1105,7 +1099,7 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, fullPath str
 	// Update object metadata
 	o.size = size
 	o.mtime = time.Now().UnixMilli()
-	
+
 	fs.Debugf(o.fs, "Successfully uploaded file via multipart: %s", o.remote)
 	return nil
 }
@@ -1126,7 +1120,7 @@ func (o *Object) abortMultipartUpload(ctx context.Context, uploadToken string) {
 			"Authorization": "Bearer " + token,
 		},
 	}
-	
+
 	_ = o.fs.pacer.Call(func() (bool, error) {
 		res, err := o.fs.srv.Call(ctx, &opts)
 		if err != nil {
