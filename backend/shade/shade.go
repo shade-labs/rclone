@@ -6,11 +6,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/rclone/rclone/fs/config/configmap"
-	"github.com/rclone/rclone/fs/config/configstruct"
-	"github.com/rclone/rclone/fs/fshttp"
-	"github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/lib/pacer"
 	"io"
 	"net/http"
 	"net/url"
@@ -19,6 +14,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fshttp"
+	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/pacer"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -90,19 +91,21 @@ type Options struct {
 
 // Fs represents a shade remote
 type Fs struct {
-	name      string       // name of this remote
-	root      string       // the path we are working on
-	opt       Options      // parsed options
-	features  *fs.Features // optional features
-	srv       *rest.Client // REST client for ShadeFS API
-	apiSrv    *rest.Client // REST client for Shade API
-	endpoint  string       // endpoint for ShadeFS
-	drive     string       // drive ID
-	pacer     *fs.Pacer    // pacer for API calls
-	token     string       // ShadeFS token
-	tokenExp  time.Time    // Token expiration time
-	tokenMu   sync.Mutex
-	recursive bool
+	name         string       // name of this remote
+	root         string       // the path we are working on
+	opt          Options      // parsed options
+	features     *fs.Features // optional features
+	srv          *rest.Client // REST client for ShadeFS API
+	apiSrv       *rest.Client // REST client for Shade API
+	endpoint     string       // endpoint for ShadeFS
+	drive        string       // drive ID
+	pacer        *fs.Pacer    // pacer for API calls
+	token        string       // ShadeFS token
+	tokenExp     time.Time    // Token expiration time
+	tokenMu      sync.Mutex
+	recursive    bool
+	createdDirs  map[string]bool // Cache of directories we've created
+	createdDirMu sync.RWMutex    // Mutex for createdDirs map
 }
 
 // Object describes a ShadeFS object
@@ -140,14 +143,15 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	f := &Fs{
-		name:      name,
-		root:      root,
-		opt:       *opt,
-		drive:     opt.Drive,
-		srv:       rest.NewClient(fshttp.NewClient(ctx)),
-		apiSrv:    rest.NewClient(fshttp.NewClient(ctx)),
-		pacer:     fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
-		recursive: true,
+		name:        name,
+		root:        root,
+		opt:         *opt,
+		drive:       opt.Drive,
+		srv:         rest.NewClient(fshttp.NewClient(ctx)),
+		apiSrv:      rest.NewClient(fshttp.NewClient(ctx)),
+		pacer:       fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		recursive:   true,
+		createdDirs: make(map[string]bool),
 	}
 
 	f.features = &fs.Features{
@@ -183,6 +187,15 @@ func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	_, err = f.getShadeToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ShadeFS token: %w", err)
+	}
+
+	// If root is specified, ensure it exists
+	if f.root != "" && f.root != "/" && f.root != "." {
+		fs.Debugf(f, "Ensuring root directory exists: %s", f.root)
+		if err := f.ensureDirectoryPath(ctx, f.root); err != nil {
+			fs.Debugf(f, "Warning: failed to create root directory %s: %v", f.root, err)
+			// Don't fail - the directory might already exist or be created on demand
+		}
 	}
 
 	return f, nil
@@ -295,7 +308,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	res, err := f.callAPI(ctx, "GET", fmt.Sprintf("/%s/fs/listdir?path=%s", f.drive, encodedPath), &response)
 	if err != nil {
 		fs.Debugf(f, "Error from List call: %v", err)
-		return nil, err
+		return nil, fs.ErrorDirNotFound
 	}
 
 	if res.StatusCode == http.StatusNotFound {
@@ -410,23 +423,129 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	return o, o.Update(ctx, in, src, options...)
 }
 
+// ensureParentDirectories creates all parent directories for a given path
+func (f *Fs) ensureParentDirectories(ctx context.Context, remotePath string) error {
+	// Build the full path including root
+	fullPath := remotePath
+	if f.root != "" {
+		fullPath = path.Join(f.root, remotePath)
+	}
+
+	// Get the parent directory path
+	parentDir := path.Dir(fullPath)
+
+	// If parent is root, empty, or current dir, nothing to create
+	if parentDir == "" || parentDir == "." || parentDir == "/" {
+		return nil
+	}
+
+	// Ensure the full parent directory path exists
+	return f.ensureDirectoryPath(ctx, parentDir)
+}
+
+// ensureDirectoryPath creates all directories in a path
+func (f *Fs) ensureDirectoryPath(ctx context.Context, dirPath string) error {
+	// Check cache first
+	f.createdDirMu.RLock()
+	if f.createdDirs[dirPath] {
+		f.createdDirMu.RUnlock()
+		fs.Debugf(f, "Directory already created (cached): %s", dirPath)
+		return nil
+	}
+	f.createdDirMu.RUnlock()
+
+	// Build list of all directories that need to be created
+	var dirsToCreate []string
+	currentPath := dirPath
+
+	for currentPath != "" && currentPath != "." && currentPath != "/" {
+		// Check if this directory is already in cache
+		f.createdDirMu.RLock()
+		inCache := f.createdDirs[currentPath]
+		f.createdDirMu.RUnlock()
+
+		if !inCache {
+			dirsToCreate = append([]string{currentPath}, dirsToCreate...)
+		}
+		currentPath = path.Dir(currentPath)
+	}
+
+	// If all directories are cached, we're done
+	if len(dirsToCreate) == 0 {
+		fs.Debugf(f, "All parent directories already created (cached)")
+		return nil
+	}
+
+	// Create each directory in order
+	for _, dir := range dirsToCreate {
+		fs.Debugf(f, "Creating directory: %s", dir)
+
+		encodedPath := url.QueryEscape(dir)
+		res, err := f.callAPI(ctx, "POST", fmt.Sprintf("/%s/fs/mkdir?path=%s", f.drive, encodedPath), nil)
+
+		// If directory already exists, that's fine
+		if err == nil && res != nil {
+			defer fs.CheckClose(res.Body, &err)
+			if res.StatusCode == http.StatusConflict || res.StatusCode == http.StatusUnprocessableEntity {
+				fs.Debugf(f, "Directory already exists on server: %s", dir)
+				// Add to cache even if it already existed
+				f.createdDirMu.Lock()
+				f.createdDirs[dir] = true
+				f.createdDirMu.Unlock()
+				continue
+			}
+			if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
+				fs.Debugf(f, "Failed to create directory %s: status code %d", dir, res.StatusCode)
+				// Continue anyway - maybe it exists or will be auto-created
+				continue
+			}
+			fs.Debugf(f, "Successfully created directory: %s", dir)
+			// Add to cache
+			f.createdDirMu.Lock()
+			f.createdDirs[dir] = true
+			f.createdDirMu.Unlock()
+		} else if err != nil {
+			fs.Debugf(f, "Error creating directory %s: %v", dir, err)
+			// Continue anyway
+			continue
+		}
+	}
+
+	// Mark the full path as created in cache
+	f.createdDirMu.Lock()
+	f.createdDirs[dirPath] = true
+	f.createdDirMu.Unlock()
+
+	return nil
+}
+
 // Mkdir creates a directory
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	fs.Debugf(f, "Creating directory: %s", dir)
 
-	encodedPath := f.buildFullPath(dir)
-	fs.Debugf(f, "Encoded path for mkdir: %s", encodedPath)
-
-	res, err := f.callAPI(ctx, "POST", fmt.Sprintf("/%s/fs/mkdir?path=%s", f.drive, encodedPath), nil)
-	if err != nil {
-		fs.Debugf(f, "Error creating directory: %v", err)
-		return err
+	// Build the full path for the directory
+	fullPath := dir
+	if dir == "" {
+		// If dir is empty, we're creating the root directory
+		if f.root != "" && f.root != "/" && f.root != "." {
+			fullPath = f.root
+		} else {
+			// Nothing to create
+			return nil
+		}
+	} else if f.root != "" {
+		fullPath = path.Join(f.root, dir)
 	}
-	defer fs.CheckClose(res.Body, &err)
 
-	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
-		return fmt.Errorf("mkdir failed with status code: %d", res.StatusCode)
+	// Ensure all parent directories exist first
+	if err := f.ensureDirectoryPath(ctx, fullPath); err != nil {
+		return fmt.Errorf("failed to create directory path: %w", err)
 	}
+
+	// Add to cache
+	f.createdDirMu.Lock()
+	f.createdDirs[fullPath] = true
+	f.createdDirMu.Unlock()
 
 	fs.Debugf(f, "Successfully created directory: %s", dir)
 	return nil
@@ -698,6 +817,12 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	fullPath := o.remote
 	if o.fs.root != "" {
 		fullPath = path.Join(o.fs.root, o.remote)
+	}
+
+	// Ensure parent directories exist by creating them recursively if needed
+	if err := o.fs.ensureParentDirectories(ctx, o.remote); err != nil {
+		fs.Debugf(o.fs, "Warning: failed to ensure parent directories for %s: %v", o.remote, err)
+		// Continue anyway - maybe the server handles this
 	}
 
 	return o.uploadMultipart(ctx, in, fullPath, size)
