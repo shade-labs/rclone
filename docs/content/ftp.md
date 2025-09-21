@@ -184,7 +184,7 @@ Properties:
 - Config:      user
 - Env Var:     RCLONE_FTP_USER
 - Type:        string
-- Default:     "jacobhasselbring"
+- Default:     "$USER"
 
 #### --ftp-port
 

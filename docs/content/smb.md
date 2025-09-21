@@ -134,7 +134,7 @@ Properties:
 - Config:      user
 - Env Var:     RCLONE_SMB_USER
 - Type:        string
-- Default:     "jacobhasselbring"
+- Default:     "$USER"
 
 #### --smb-port
 

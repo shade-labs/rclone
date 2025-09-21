@@ -416,7 +416,7 @@ Properties:
 - Config:      user
 - Env Var:     RCLONE_SFTP_USER
 - Type:        string
-- Default:     "jacobhasselbring"
+- Default:     "$USER"
 
 #### --sftp-port
 
