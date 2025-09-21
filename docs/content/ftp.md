@@ -184,7 +184,7 @@ Properties:
 - Config:      user
 - Env Var:     RCLONE_FTP_USER
 - Type:        string
-- Default:     "$USER"
+- Default:     "jacobhasselbring"
 
 #### --ftp-port
 
@@ -430,6 +430,20 @@ Properties:
 
 - Config:      socks_proxy
 - Env Var:     RCLONE_FTP_SOCKS_PROXY
+- Type:        string
+- Required:    false
+
+#### --ftp-http-proxy
+
+URL for HTTP CONNECT proxy
+
+Set this to a URL for an HTTP proxy which supports the HTTP CONNECT verb.
+
+
+Properties:
+
+- Config:      http_proxy
+- Env Var:     RCLONE_FTP_HTTP_PROXY
 - Type:        string
 - Required:    false
 

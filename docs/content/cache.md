@@ -460,7 +460,7 @@ Properties:
 - Config:      db_path
 - Env Var:     RCLONE_CACHE_DB_PATH
 - Type:        string
-- Default:     "$HOME/.cache/rclone/cache-backend"
+- Default:     "/Users/jacobhasselbring/Library/Caches/rclone/cache-backend"
 
 #### --cache-chunk-path
 
@@ -478,7 +478,7 @@ Properties:
 - Config:      chunk_path
 - Env Var:     RCLONE_CACHE_CHUNK_PATH
 - Type:        string
-- Default:     "$HOME/.cache/rclone/cache-backend"
+- Default:     "/Users/jacobhasselbring/Library/Caches/rclone/cache-backend"
 
 #### --cache-db-purge
 

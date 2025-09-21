@@ -1,5 +1,4 @@
 // Package shade provides an interface to the Shade storage system.
-// running with: -vv copy shadefs_v1:Test "/Users/gurish/Movies/Shade/Movie Trailers" --multi-thread-cutoff 1000G
 package shade
 
 import (
@@ -7,20 +6,19 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"path"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/rclone/rclone/backend/shade/api"
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/chunksize"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -28,7 +26,6 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/lib/encoder"
-	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -42,7 +39,7 @@ const (
 	defaultChunkSize = 64 * 1024 * 1024        // Default chunk size (64MB)
 	minChunkSize     = 5 * 1024 * 1024         // Minimum chunk size (5MB) - S3 requirement
 	maxChunkSize     = 5 * 1024 * 1024 * 1024  // Maximum chunk size (5GB)
-	maxUploadParts   = 10000                   // maximum allowed number of parts in a multi-part upload
+	maxUploadParts   = 10000                   // maximum allowed number of parts in a multipart upload
 )
 
 // Register with Fs
@@ -51,11 +48,6 @@ func init() {
 		Name:        "shade",
 		Description: "Shade FS",
 		NewFs:       NewFS,
-		CommandHelp: []fs.CommandHelp{{
-			Name:  "token",
-			Short: "Get a ShadeFS token",
-			Long:  "Get and display a ShadeFS token for the configured drive",
-		}},
 		Options: []fs.Option{{
 			Name:      "drive_id",
 			Help:      "The ID of your drive, see this in the drive settings. Individual rclone configs must be made per drive.",
@@ -97,166 +89,14 @@ func init() {
 	})
 }
 
-// Options defines the configuration for this backend
-type Options struct {
-	Drive          string        `config:"drive_id"`
-	ApiKey         string        `config:"api_key"`
-	Endpoint       string        `config:"endpoint"`
-	ChunkSize      fs.SizeSuffix `config:"chunk_size"`
-	MaxUploadParts int           `config:"max_upload_parts"`
-	Concurrency    int           `config:"upload_concurrency"`
-	UploadCutoff   fs.SizeSuffix `config:"upload_cutoff"`
-	Encoding       encoder.MultiEncoder
-}
-
-// Fs represents a shade remote
-type Fs struct {
-	name         string       // name of this remote
-	root         string       // the path we are working on
-	opt          Options      // parsed options
-	features     *fs.Features // optional features
-	srv          *rest.Client // REST client for ShadeFS API
-	apiSrv       *rest.Client // REST client for Shade API
-	endpoint     string       // endpoint for ShadeFS
-	drive        string       // drive ID
-	pacer        *fs.Pacer    // pacer for API calls
-	token        string       // ShadeFS token
-	tokenExp     time.Time    // Token expiration time
-	tokenMu      sync.Mutex
-	recursive    bool
-	createdDirs  map[string]bool // Cache of directories we've created
-	createdDirMu sync.RWMutex    // Mutex for createdDirs map
-}
-
-// Object describes a ShadeFS object
-type Object struct {
-	fs     *Fs    // what this object is part of
-	remote string // The remote path
-	mtime  int64  // Modified time
-	hash   string // Content hash
-	size   int64  // Size of the object
-}
-
-// Directory describes a ShadeFS directory
-type Directory struct {
-	fs     *Fs    // Reference to the filesystem
-	remote string // Path to the directory
-	mtime  int64  // Modification time
-	size   int64  // Size (typically 0 for directories)
-}
-
-// NewFS constructs an FS from the path, container:path
-func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
-	// Parse config into Options struct
-	opt := new(Options)
-	err := configstruct.Set(m, opt)
-	if err != nil {
-		return nil, err
-	}
-
-	fs.Debugf(nil, "Creating new ShadeFS backend with drive: %s", opt.Drive)
-
-	f := &Fs{
-		name:        name,
-		root:        root,
-		opt:         *opt,
-		drive:       opt.Drive,
-		srv:         rest.NewClient(fshttp.NewClient(ctx)),
-		apiSrv:      rest.NewClient(fshttp.NewClient(ctx)),
-		pacer:       fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
-		recursive:   true,
-		createdDirs: make(map[string]bool),
-	}
-
-	f.features = &fs.Features{
-		// Initially set minimal features
-		// We'll expand this in a future iteration
-		CanHaveEmptyDirectories: true,
-		OpenChunkWriter:         f.OpenChunkWriter,
-	}
-
-	// Set the endpoint
-	if opt.Endpoint == "" {
-		f.endpoint = defaultEndpoint
-	} else {
-		f.endpoint = opt.Endpoint
-	}
-
-	// Validate and set chunk size
-	if opt.ChunkSize == 0 {
-		opt.ChunkSize = fs.SizeSuffix(defaultChunkSize)
-	} else if opt.ChunkSize < fs.SizeSuffix(minChunkSize) {
-		return nil, fmt.Errorf("chunk_size %d is less than minimum %d", opt.ChunkSize, minChunkSize)
-	} else if opt.ChunkSize > fs.SizeSuffix(maxChunkSize) {
-		return nil, fmt.Errorf("chunk_size %d is greater than maximum %d", opt.ChunkSize, maxChunkSize)
-	}
-	fs.Debugf(f, "Using chunk size: %d bytes", opt.ChunkSize)
-
-	// Ensure root doesn't have trailing slash
-	f.root = strings.Trim(f.root, "/")
-	if f.root != "" {
-		fs.Debugf(f, "Root directory is: %s", f.root)
-	}
-
-	// Check that we can log in by getting a token
-	_, err = f.getShadeToken(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get ShadeFS token: %w", err)
-	}
-
-	var response ListDirResponse
-	res, err := f.callAPI(ctx, "GET", fmt.Sprintf("/%s/fs/attr?path=%s", f.drive, url.QueryEscape(root)), &response)
-
-	if response.Type == "file" {
-		//Specified a single file path, not a directory.
-		f.root = filepath.Dir(f.root)
-		return f, fs.ErrorIsFile
-	}
-
-	if res != nil && res.StatusCode == http.StatusNotFound {
-		return f, nil
-	}
-	return f, nil
-}
-
-// Name of the remote (as passed into NewFs)
-func (f *Fs) Name() string {
-	return f.name
-}
-
-// Root of the remote (as passed into NewFs)
-func (f *Fs) Root() string {
-	return f.root
-}
-
-// String returns a description of the FS
-func (f *Fs) String() string {
-	return fmt.Sprintf("Shade drive %s path %s", f.opt.Drive, f.root)
-}
-
-// Precision returns the precision of the ModTimes
-func (f *Fs) Precision() time.Duration {
-	return fs.ModTimeNotSupported
-}
-
-// Hashes returns the supported hash types
-func (f *Fs) Hashes() hash.Set {
-	return hash.Set(hash.MD5)
-}
-
-// Features returns the optional features of this Fs
-func (f *Fs) Features() *fs.Features {
-	return f.features
-}
-
-// getShadeToken retrieves or refreshes the ShadeFS token
-func (f *Fs) getShadeToken(ctx context.Context) (string, error) {
+// refreshJWTToken retrieves or refreshes the ShadeFS token
+func (f *Fs) refreshJWTToken(ctx context.Context) (string, error) {
 	fs.Debugf(f, "Checking if token is valid...")
 	f.tokenMu.Lock()
 	defer f.tokenMu.Unlock()
 	// Return existing token if it's still valid
-	checkTime := f.tokenExp.Add(-1 * time.Minute)
-	//If the token expires in less than a second, just get a new one
+	checkTime := f.tokenExp.Add(-2 * time.Minute)
+	//If the token expires in less than two minutes, just get a new one
 	if f.token != "" && time.Now().Before(checkTime) {
 
 		fs.Debugf(f, "Using existing token (expires in %v)", f.tokenExp.Sub(time.Now()))
@@ -339,12 +179,242 @@ func (f *Fs) getShadeToken(ctx context.Context) (string, error) {
 	return f.token, nil
 }
 
+func (f *Fs) callAPI(ctx context.Context, method, path string, response interface{}) (*http.Response, error) {
+	token, err := f.refreshJWTToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	opts := rest.Opts{
+		Method:  method,
+		Path:    path,
+		RootURL: f.endpoint,
+		ExtraHeaders: map[string]string{
+			"Authorization": "Bearer " + token,
+		},
+	}
+	var res *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		if response != nil {
+			res, err = f.srv.CallJSON(ctx, &opts, nil, response)
+		} else {
+			res, err = f.srv.Call(ctx, &opts)
+		}
+		if err != nil {
+			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
+		}
+		return false, nil
+	})
+	return res, err
+}
+
+// Options defines the configuration for this backend
+type Options struct {
+	Drive          string        `config:"drive_id"`
+	ApiKey         string        `config:"api_key"`
+	Endpoint       string        `config:"endpoint"`
+	ChunkSize      fs.SizeSuffix `config:"chunk_size"`
+	MaxUploadParts int           `config:"max_upload_parts"`
+	Concurrency    int           `config:"upload_concurrency"`
+	UploadCutoff   fs.SizeSuffix `config:"upload_cutoff"`
+	Encoding       encoder.MultiEncoder
+}
+
+// Fs represents a shade remote
+type Fs struct {
+	name         string       // name of this remote
+	root         string       // the path we are working on
+	opt          Options      // parsed options
+	features     *fs.Features // optional features
+	srv          *rest.Client // REST client for ShadeFS API
+	apiSrv       *rest.Client // REST client for Shade API
+	endpoint     string       // endpoint for ShadeFS
+	drive        string       // drive ID
+	pacer        *fs.Pacer    // pacer for API calls
+	token        string       // ShadeFS token
+	tokenExp     time.Time    // Token expiration time
+	tokenMu      sync.Mutex
+	recursive    bool
+	createdDirs  map[string]bool // Cache of directories we've created
+	createdDirMu sync.RWMutex    // Mutex for createdDirs map
+}
+
+// Object describes a ShadeFS object
+type Object struct {
+	fs     *Fs    // what this object is part of
+	remote string // The remote path
+	mtime  int64  // Modified time
+	hash   string // Content hash (As of September 2025 Shadefs does not store hashes, so this is mostly redundant
+	size   int64  // Size of the object
+}
+
+// Directory describes a ShadeFS directory
+type Directory struct {
+	fs     *Fs    // Reference to the filesystem
+	remote string // Path to the directory
+	mtime  int64  // Modification time
+	size   int64  // Size (typically 0 for directories)
+}
+
+// Name of the remote (as passed into NewFs)
+func (f *Fs) Name() string {
+	return f.name
+}
+
+// Root of the remote (as passed into NewFs)
+func (f *Fs) Root() string {
+	return f.root
+}
+
+// String returns a description of the FS
+func (f *Fs) String() string {
+	return fmt.Sprintf("Shade drive %s path %s", f.opt.Drive, f.root)
+}
+
+// Precision returns the precision of the ModTimes
+func (f *Fs) Precision() time.Duration {
+	return fs.ModTimeNotSupported
+}
+
+// Hashes returns the supported hash types
+func (f *Fs) Hashes() hash.Set {
+	return hash.Set(hash.MD5)
+}
+
+// Features returns the optional features of this Fs
+func (f *Fs) Features() *fs.Features {
+	return f.features
+}
+
+// NewFS constructs an FS from the path, container:path
+func NewFS(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
+
+	fs.Debugf(nil, "Creating new ShadeFS backend with drive: %s", opt.Drive)
+
+	f := &Fs{
+		name:        name,
+		root:        root,
+		opt:         *opt,
+		drive:       opt.Drive,
+		srv:         rest.NewClient(fshttp.NewClient(ctx)),
+		apiSrv:      rest.NewClient(fshttp.NewClient(ctx)),
+		pacer:       fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		recursive:   true,
+		createdDirs: make(map[string]bool),
+	}
+
+	f.features = &fs.Features{
+		// Initially set minimal features
+		// We'll expand this in a future iteration
+		CanHaveEmptyDirectories: true,
+		OpenChunkWriter:         f.OpenChunkWriter,
+	}
+
+	// Set the endpoint
+	if opt.Endpoint == "" {
+		f.endpoint = defaultEndpoint
+	} else {
+		f.endpoint = opt.Endpoint
+	}
+
+	// Validate and set chunk size
+	if opt.ChunkSize == 0 {
+		opt.ChunkSize = fs.SizeSuffix(defaultChunkSize)
+	} else if opt.ChunkSize < fs.SizeSuffix(minChunkSize) {
+		return nil, fmt.Errorf("chunk_size %d is less than minimum %d", opt.ChunkSize, minChunkSize)
+	} else if opt.ChunkSize > fs.SizeSuffix(maxChunkSize) {
+		return nil, fmt.Errorf("chunk_size %d is greater than maximum %d", opt.ChunkSize, maxChunkSize)
+	}
+	fs.Debugf(f, "Using chunk size: %d bytes", opt.ChunkSize)
+
+	// Ensure root doesn't have trailing slash
+	f.root = strings.Trim(f.root, "/")
+	if f.root != "" {
+		fs.Debugf(f, "Root directory is: %s", f.root)
+	}
+
+	// Check that we can log in by getting a token
+	_, err = f.refreshJWTToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ShadeFS token: %w", err)
+	}
+
+	var response api.ListDirResponse
+	_, err = f.callAPI(ctx, "GET", fmt.Sprintf("/%s/fs/attr?path=%s", f.drive, url.QueryEscape(root)), &response)
+
+	if response.Type == "file" {
+		//Specified a single file path, not a directory.
+		f.root = filepath.Dir(f.root)
+		return f, fs.ErrorIsFile
+	}
+	return f, nil
+}
+
+// NewObject finds the Object at remote
+func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	fs.Debugf(f, "Finding object: %s", remote)
+
+	fullPath := f.buildFullPath(remote)
+
+	var response api.ListDirResponse
+	res, err := f.callAPI(ctx, "GET", fmt.Sprintf("/%s/fs/attr?path=%s", f.drive, fullPath), &response)
+
+	if res != nil && res.StatusCode == http.StatusNotFound {
+		fs.Debugf(f, "Object not found")
+		return nil, fs.ErrorObjectNotFound
+	}
+
+	if err != nil {
+		fs.Debugf(f, "Error from NewObject call: %v", err)
+		return nil, err
+	}
+
+	if res != nil && res.StatusCode != http.StatusOK {
+		fs.Debugf(f, "Bad status code from server: %d", res.StatusCode)
+		return nil, fmt.Errorf("attr failed with status code: %d", res.StatusCode)
+	}
+
+	fs.Debugf(f, "Received object info: type=%s, size=%d", response.Type, response.Size)
+
+	if response.Type == "tree" {
+		fs.Debugf(f, "Path is a directory: %s", remote)
+		return nil, fs.ErrorIsDir
+	}
+
+	if response.Type != "file" {
+		fs.Debugf(f, "Path is not a file: %s (type=%s)", remote, response.Type)
+		return nil, fmt.Errorf("path is not a file: %s", remote)
+	}
+
+	return &Object{
+		fs:     f,
+		remote: remote,
+		mtime:  response.Mtime,
+		size:   response.Size,
+	}, nil
+}
+
+// Put uploads a file
+func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	// Create temporary object
+	o := &Object{
+		fs:     f,
+		remote: src.Remote(),
+	}
+	return o, o.Update(ctx, in, src, options...)
+}
+
 // List the objects and directories in dir into entries
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 
 	fullPath := f.buildFullPath(dir)
 
-	var response []ListDirResponse
+	var response []api.ListDirResponse
 	res, err := f.callAPI(ctx, "GET", fmt.Sprintf("/%s/fs/listdir?path=%s", f.drive, fullPath), &response)
 	if err != nil {
 		fs.Debugf(f, "Error from List call: %v", err)
@@ -409,60 +479,6 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return entries, nil
 }
 
-// NewObject finds the Object at remote
-func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	fs.Debugf(f, "Finding object: %s", remote)
-
-	fullPath := f.buildFullPath(remote)
-
-	var response ListDirResponse
-	res, err := f.callAPI(ctx, "GET", fmt.Sprintf("/%s/fs/attr?path=%s", f.drive, fullPath), &response)
-
-	if res != nil && res.StatusCode == http.StatusNotFound {
-		fs.Debugf(f, "Object not found")
-		return nil, fs.ErrorObjectNotFound
-	}
-
-	if err != nil {
-		fs.Debugf(f, "Error from NewObject call: %v", err)
-		return nil, err
-	}
-
-	if res != nil && res.StatusCode != http.StatusOK {
-		fs.Debugf(f, "Bad status code from server: %d", res.StatusCode)
-		return nil, fmt.Errorf("attr failed with status code: %d", res.StatusCode)
-	}
-
-	fs.Debugf(f, "Received object info: type=%s, size=%d", response.Type, response.Size)
-
-	if response.Type == "tree" {
-		fs.Debugf(f, "Path is a directory: %s", remote)
-		return nil, fs.ErrorIsDir
-	}
-
-	if response.Type != "file" {
-		fs.Debugf(f, "Path is not a file: %s (type=%s)", remote, response.Type)
-		return nil, fmt.Errorf("path is not a file: %s", remote)
-	}
-
-	return &Object{
-		fs:     f,
-		remote: remote,
-		mtime:  response.Mtime,
-		size:   response.Size,
-	}, nil
-}
-
-// Put uploads a file
-func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Create temporary object
-	o := &Object{
-		fs:     f,
-		remote: src.Remote(),
-	}
-	return o, o.Update(ctx, in, src, options...)
-}
-
 // ensureParentDirectories creates all parent directories for a given path
 func (f *Fs) ensureParentDirectories(ctx context.Context, remotePath string) error {
 	// Build the full path including root
@@ -525,25 +541,21 @@ func (f *Fs) ensureDirectoryPath(ctx context.Context, dirPath string) error {
 
 		// If directory already exists, that's fine
 		if err == nil && res != nil {
-			defer fs.CheckClose(res.Body, &err)
 			if res.StatusCode == http.StatusConflict || res.StatusCode == http.StatusUnprocessableEntity {
 				fs.Debugf(f, "Directory already exists on server: %s", dir)
-				// Add to cache even if it already existed
 				f.createdDirMu.Lock()
 				f.createdDirs[dir] = true
 				f.createdDirMu.Unlock()
-				continue
-			}
-			if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
+			} else if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
 				fs.Debugf(f, "Failed to create directory %s: status code %d", dir, res.StatusCode)
-				// Continue anyway - maybe it exists or will be auto-created
-				continue
+			} else {
+				fs.Debugf(f, "Successfully created directory: %s", dir)
+				f.createdDirMu.Lock()
+				f.createdDirs[dir] = true
+				f.createdDirMu.Unlock()
 			}
-			fs.Debugf(f, "Successfully created directory: %s", dir)
-			// Add to cache
-			f.createdDirMu.Lock()
-			f.createdDirs[dir] = true
-			f.createdDirMu.Unlock()
+
+			fs.CheckClose(res.Body, &err)
 		} else if err != nil {
 			fs.Debugf(f, "Error creating directory %s: %v", dir, err)
 			// Continue anyway
@@ -559,7 +571,7 @@ func (f *Fs) ensureDirectoryPath(ctx context.Context, dirPath string) error {
 	return nil
 }
 
-// Mkdir creates a directory
+// Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	fs.Debugf(f, "Creating directory: %s", dir)
 
@@ -591,13 +603,19 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	return nil
 }
 
-// Rmdir removes a directory
+// Rmdir deletes the root folder
+//
+// Returns an error if it isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	fs.Debugf(f, "Removing directory: %s", dir)
-
 	fullPath := f.buildFullPath(dir)
+
+	if fullPath == "" {
+		return errors.New("cannot delete root directory")
+	}
+
 	fs.Debugf(f, "Encoded path for rmdir: %s", fullPath)
-	var response []ListDirResponse
+	var response []api.ListDirResponse
 	res, err := f.callAPI(ctx, "GET", fmt.Sprintf("/%s/fs/listdir?path=%s", f.drive, fullPath), &response)
 
 	if len(response) > 0 {
@@ -620,8 +638,24 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return fmt.Errorf("rmdir failed with status code: %d", res.StatusCode)
 	}
 
+	f.createdDirMu.Lock()
+	defer f.createdDirMu.Unlock()
+	unescapedPath, err := url.QueryUnescape(fullPath)
+	if err != nil {
+		return err
+	}
+	f.createdDirs[unescapedPath] = false
+
 	fs.Debugf(f, "Successfully removed directory: %s", dir)
 	return nil
+}
+
+// Attempts to construct the full path for an object query-escaped
+func (f *Fs) buildFullPath(remote string) string {
+	if f.root == "" {
+		return url.QueryEscape(remote)
+	}
+	return url.QueryEscape(path.Join(f.root, remote))
 }
 
 // -------------------------------------------------
@@ -646,16 +680,6 @@ func (o *Object) Remote() string {
 	return o.remote
 }
 
-// ModTime returns the modification date of the object
-func (o *Object) ModTime(ctx context.Context) time.Time {
-	return time.Unix(0, o.mtime*int64(time.Millisecond))
-}
-
-// Size returns the size of the object
-func (o *Object) Size() int64 {
-	return o.size
-}
-
 // Hash returns the requested hash of the object content
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	if t != hash.MD5 {
@@ -675,7 +699,12 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer reader.Close()
+	defer func(reader io.ReadCloser) {
+		err := reader.Close()
+		if err != nil {
+			fs.Debugf(o.fs, "Failed to close reader: %v", err)
+		}
+	}(reader)
 
 	// Read the entire file to compute the hash
 	_, err = io.Copy(io.Discard, reader)
@@ -691,17 +720,28 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	return o.hash, nil
 }
 
+// Size returns the size of the object
+func (o *Object) Size() int64 {
+	return o.size
+}
+
+// ModTime returns the modification date of the object
+func (o *Object) ModTime(context.Context) time.Time {
+	return time.Unix(0, o.mtime*int64(time.Millisecond))
+}
+
+// SetModTime sets the modification time of the object
+func (o *Object) SetModTime(context.Context, time.Time) error {
+	// Not implemented for now
+	return fs.ErrorCantSetModTime
+}
+
 // Storable returns whether this object is storable
 func (o *Object) Storable() bool {
 	return true
 }
 
-// SetModTime sets the modification time of the object
-func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
-	// Not implemented for now
-	return fs.ErrorCantSetModTime
-}
-
+// Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.Debugf(o.fs, "Opening file: %s", o.remote)
 
@@ -711,7 +751,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 	fs.FixRangeOption(options, o.size)
 
-	token, err := o.fs.getShadeToken(ctx)
+	token, err := o.fs.refreshJWTToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -888,44 +928,9 @@ func (o *Object) Remove(ctx context.Context) error {
 	defer fs.CheckClose(res.Body, &err) // Ensure body is closed
 
 	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
-		return fmt.Errorf("Object removal failed with status code: %d", res.StatusCode)
+		return fmt.Errorf("object removal failed with status code: %d", res.StatusCode)
 	}
 	return nil
-}
-
-func (f *Fs) buildFullPath(remote string) string {
-	if f.root == "" {
-		return url.QueryEscape(remote)
-	}
-	return url.QueryEscape(path.Join(f.root, remote))
-}
-
-func (f *Fs) callAPI(ctx context.Context, method, path string, response interface{}) (*http.Response, error) {
-	token, err := f.getShadeToken(ctx)
-	if err != nil {
-		return nil, err
-	}
-	opts := rest.Opts{
-		Method:  method,
-		Path:    path,
-		RootURL: f.endpoint,
-		ExtraHeaders: map[string]string{
-			"Authorization": "Bearer " + token,
-		},
-	}
-	var res *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		if response != nil {
-			res, err = f.srv.CallJSON(ctx, &opts, nil, response)
-		} else {
-			res, err = f.srv.Call(ctx, &opts)
-		}
-		if err != nil {
-			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
-		}
-		return false, nil
-	})
-	return res, err
 }
 
 // -------------------------------------------------
@@ -938,7 +943,7 @@ func (d *Directory) Remote() string {
 }
 
 // ModTime returns the modification time
-func (d *Directory) ModTime(ctx context.Context) time.Time {
+func (d *Directory) ModTime(context.Context) time.Time {
 	return time.Unix(0, d.mtime*int64(time.Millisecond))
 }
 
@@ -953,12 +958,12 @@ func (d *Directory) Fs() fs.Info {
 }
 
 // Hash is unsupported for directories
-func (d *Directory) Hash(ctx context.Context, t hash.Type) (string, error) {
+func (d *Directory) Hash(context.Context, hash.Type) (string, error) {
 	return "", hash.ErrUnsupported
 }
 
 // SetModTime is unsupported for directories
-func (d *Directory) SetModTime(ctx context.Context, t time.Time) error {
+func (d *Directory) SetModTime(context.Context, time.Time) error {
 	return fs.ErrorCantSetModTime
 }
 
@@ -968,7 +973,7 @@ func (d *Directory) Storable() bool {
 }
 
 // Open returns an error for directories
-func (d *Directory) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+func (d *Directory) Open() (io.ReadCloser, error) {
 	fs.Debugf(d.fs, "Attempted to open directory: %s", d.remote)
 	return nil, fs.ErrorIsDir
 }
@@ -987,360 +992,9 @@ func (d *Directory) String() string {
 	return fmt.Sprintf("Directory: %s", d.remote)
 }
 
-// uploadMultipart handles multipart upload for larger files
-func (o *Object) uploadMultipart(ctx context.Context, src fs.ObjectInfo, in io.Reader, options ...fs.OpenOption) error {
-
-	chunkWriter, err := multipart.UploadMultipart(ctx, src, in, multipart.UploadMultipartOptions{
-		Open:        o.fs,
-		OpenOptions: options,
-	})
-	if err != nil {
-		return err
-	}
-
-	var shadeWriter *shadeChunkWriter = chunkWriter.(*shadeChunkWriter)
-
-	o.size = shadeWriter.size
-	o.mtime = time.Now().UnixMilli()
-
-	return nil
-}
-
-// abortMultipartUpload aborts a multipart upload
-func (o *Object) abortMultipartUpload(ctx context.Context, uploadToken string) {
-	token, err := o.fs.getShadeToken(ctx)
-	if err != nil {
-		fs.Debugf(o.fs, "Failed to get token for abort: %v", err)
-		return
-	}
-
-	opts := rest.Opts{
-		Method:  "POST",
-		Path:    fmt.Sprintf("/%s/upload/abort/multipart?token=%s", o.fs.drive, url.QueryEscape(uploadToken)),
-		RootURL: o.fs.endpoint,
-		ExtraHeaders: map[string]string{
-			"Authorization": "Bearer " + token,
-		},
-	}
-
-	_ = o.fs.pacer.Call(func() (bool, error) {
-		res, err := o.fs.srv.Call(ctx, &opts)
-		if err != nil {
-			fs.Debugf(o.fs, "Failed to abort multipart upload: %v", err)
-			return false, nil // Don't retry abort
-		}
-		if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
-			fs.Debugf(o.fs, "Abort returned status %d", res.StatusCode)
-		}
-		return false, nil
-	})
-}
-
-func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectInfo, options ...fs.OpenOption) (info fs.ChunkWriterInfo, writer fs.ChunkWriter, err error) {
-	// Temporary Object under construction
-	o := &Object{
-		fs:     f,
-		remote: remote,
-	}
-
-	uploadParts := f.opt.MaxUploadParts
-	if uploadParts < 1 {
-		uploadParts = 1
-	} else if uploadParts > maxUploadParts {
-		uploadParts = maxUploadParts
-	}
-	size := src.Size()
-
-	// calculate size of parts
-	chunkSize := f.opt.ChunkSize
-	chunkSize = chunksize.Calculator(src, size, uploadParts, chunkSize)
-
-	token, err := o.fs.getShadeToken(ctx)
-	if err != nil {
-		return info, nil, fmt.Errorf("failed to get token: %w", err)
-	}
-
-	err = f.ensureParentDirectories(ctx, remote)
-	if err != nil {
-		return info, nil, fmt.Errorf("failed to ensure parent directories: %w", err)
-	}
-
-	fullPath := remote
-	if f.root != "" {
-		fullPath = path.Join(f.root, remote)
-	}
-
-	// Initiate multipart upload
-	type initRequest struct {
-		Path     string `json:"path"`
-		PartSize int64  `json:"partSize"`
-	}
-	reqBody := initRequest{
-		Path:     fullPath,
-		PartSize: int64(chunkSize),
-	}
-
-	var initResp struct {
-		Token string `json:"token"`
-	}
-
-	opts := rest.Opts{
-		Method:  "POST",
-		Path:    fmt.Sprintf("/%s/upload/multipart", o.fs.drive),
-		RootURL: o.fs.endpoint,
-		ExtraHeaders: map[string]string{
-			"Authorization": "Bearer " + token,
-		},
-	}
-
-	err = o.fs.pacer.Call(func() (bool, error) {
-		res, err := o.fs.srv.CallJSON(ctx, &opts, reqBody, &initResp)
-		if err != nil {
-			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
-		}
-		return false, nil
-	})
-
-	if err != nil {
-		return info, nil, fmt.Errorf("failed to initiate multipart upload: %w", err)
-	}
-
-	chunkWriter := &shadeChunkWriter{
-		initToken: initResp.Token,
-		chunkSize: int64(chunkSize),
-		size:      size,
-		f:         f,
-		o:         o,
-	}
-	info = fs.ChunkWriterInfo{
-		ChunkSize:         int64(chunkSize),
-		Concurrency:       f.opt.Concurrency,
-		LeavePartsOnError: false,
-	}
-	fs.Debugf(o, "open chunk writer: started multipart upload: %v", remote)
-	return info, chunkWriter, err
-}
-
-// -------------------------------------------------
-// ListDir Response format
-// -------------------------------------------------
-
-type ListDirResponse struct {
-	Type  string `json:"type"`  // "file" or "tree"
-	Path  string `json:"path"`  // Full path including root
-	Ino   int    `json:"ino"`   // inode number
-	Mtime int64  `json:"mtime"` // Modified time in milliseconds
-	Ctime int64  `json:"ctime"` // Created time in milliseconds
-	Size  int64  `json:"size"`  // Size in bytes
-	Hash  string `json:"hash"`  // MD5 hash
-	Draft bool   `json:"draft"` // Whether this is a draft file
-}
-
 // Register interface implementations
 var (
 	_ fs.Fs        = &Fs{}
 	_ fs.Object    = &Object{}
 	_ fs.Directory = &Directory{}
 )
-
-type shadeChunkWriter struct {
-	initToken        string
-	chunkSize        int64
-	size             int64
-	f                *Fs
-	o                *Object
-	completedParts   []api.CompletedPart
-	completedPartsMu sync.Mutex
-}
-
-func (s *shadeChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader io.ReadSeeker) (bytesWritten int64, err error) {
-
-	fs.Debugf(s.f, "Multipart upload parts: %d", chunkNumber+1)
-
-	token, err := s.f.getShadeToken(ctx)
-	if err != nil {
-		return 0, err
-	}
-
-	// Read chunk
-	var chunk bytes.Buffer
-	n, err := io.Copy(&chunk, reader)
-
-	if n == 0 {
-		return 0, nil
-	}
-
-	if err != nil {
-		fs.Debugf(s.f, "Failed to copy chunk: %v", err)
-		if err != nil {
-			return 0, err
-		}
-		return 0, fmt.Errorf("failed to read chunk: %w", err)
-	}
-	// Get presigned URL for this part
-	var partURL struct {
-		URL     string            `json:"url"`
-		Headers map[string]string `json:"headers,omitempty"`
-	}
-
-	partOpts := rest.Opts{
-		Method:  "POST",
-		Path:    fmt.Sprintf("/%s/upload/multipart/part/%d?token=%s", s.f.drive, chunkNumber+1, url.QueryEscape(s.initToken)),
-		RootURL: s.f.endpoint,
-		ExtraHeaders: map[string]string{
-			"Authorization": "Bearer " + token,
-		},
-	}
-
-	err = s.f.pacer.Call(func() (bool, error) {
-		res, err := s.f.srv.CallJSON(ctx, &partOpts, nil, &partURL)
-		if err != nil {
-			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
-		}
-		return false, nil
-	})
-
-	if err != nil {
-		fs.Debugf(s.f, "Failed to upload part TEST: %v", err)
-		if err != nil {
-			return 0, err
-		}
-		return 0, fmt.Errorf("failed to get part URL: %w", err)
-	}
-	opts := rest.Opts{
-		Method:        "PUT",
-		RootURL:       partURL.URL,
-		Body:          &chunk,
-		ContentType:   "",
-		ContentLength: &n,
-	}
-
-	// Add headers
-	var uploadRes *http.Response
-	if len(partURL.Headers) > 0 {
-		opts.ExtraHeaders = make(map[string]string)
-		for k, v := range partURL.Headers {
-			opts.ExtraHeaders[k] = v
-		}
-	}
-
-	err = s.f.pacer.Call(func() (bool, error) {
-		uploadRes, err = s.f.srv.Call(ctx, &opts)
-		if err != nil {
-			return uploadRes != nil && uploadRes.StatusCode == http.StatusTooManyRequests, err
-		}
-		return false, nil
-	})
-
-	if err != nil {
-		return 0, fmt.Errorf("failed to upload part %d: %w", chunk, err)
-	}
-
-	if uploadRes.StatusCode != http.StatusOK && uploadRes.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(uploadRes.Body)
-		fs.CheckClose(uploadRes.Body, &err)
-		return 0, fmt.Errorf("part upload failed with status %d: %s", uploadRes.StatusCode, string(body))
-	}
-
-	// Get ETag from response
-	etag := uploadRes.Header.Get("ETag")
-	fs.CheckClose(uploadRes.Body, &err)
-
-	s.completedPartsMu.Lock()
-	defer s.completedPartsMu.Unlock()
-	s.completedParts = append(s.completedParts, api.CompletedPart{
-		PartNumber: int32(chunkNumber + 1),
-		ETag:       etag,
-	})
-	fs.Debugf(s.f, "Part upload completed: %d", chunkNumber+1)
-	return n, nil
-}
-
-func (s *shadeChunkWriter) Close(ctx context.Context) error {
-
-	// Complete multipart upload
-	sort.Slice(s.completedParts, func(i, j int) bool {
-		return s.completedParts[i].PartNumber < s.completedParts[j].PartNumber
-	})
-
-	type completeRequest struct {
-		Parts []api.CompletedPart `json:"parts"`
-	}
-	var completeBody completeRequest
-
-	if s.completedParts == nil {
-		completeBody = completeRequest{Parts: []api.CompletedPart{}}
-	} else {
-		completeBody = completeRequest{Parts: s.completedParts}
-	}
-
-	token, err := s.f.getShadeToken(ctx)
-	if err != nil {
-		fs.Debugf(s.f, "Failed to get token: %v", err)
-		return err
-	}
-
-	completeOpts := rest.Opts{
-		Method:  "POST",
-		Path:    fmt.Sprintf("/%s/upload/multipart/complete?token=%s", s.f.drive, url.QueryEscape(s.initToken)),
-		RootURL: s.f.endpoint,
-		ExtraHeaders: map[string]string{
-			"Authorization": "Bearer " + token,
-		},
-	}
-
-	var response http.Response
-
-	err = s.f.pacer.Call(func() (bool, error) {
-		res, err := s.f.srv.CallJSON(ctx, &completeOpts, completeBody, &response)
-		if err != nil && res.StatusCode != http.StatusOK {
-			return res != nil && res.StatusCode == http.StatusTooManyRequests, err
-		}
-		if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
-			body, _ := io.ReadAll(res.Body)
-			return false, fmt.Errorf("complete multipart failed with status %d: %s", res.StatusCode, string(body))
-		}
-		return false, nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("failed to complete multipart upload: %w", err)
-	}
-
-	fs.Debugf(s.f, "Successfully uploaded file via multipart: %s", s.o.remote)
-	return nil
-}
-
-func (s *shadeChunkWriter) Abort(ctx context.Context) error {
-	token, err := s.f.getShadeToken(ctx)
-	if err != nil {
-		fs.Debugf(s.f, "Failed to get token for abort: %v", err)
-		return err
-	}
-
-	opts := rest.Opts{
-		Method:  "POST",
-		Path:    fmt.Sprintf("/%s/upload/abort/multipart?token=%s", s.f.drive, url.QueryEscape(s.initToken)),
-		RootURL: s.f.endpoint,
-		ExtraHeaders: map[string]string{
-			"Authorization": "Bearer " + token,
-		},
-	}
-
-	err = s.f.pacer.Call(func() (bool, error) {
-		res, err := s.f.srv.Call(ctx, &opts)
-		if err != nil {
-			fs.Debugf(s.f, "Failed to abort multipart upload: %v", err)
-			return false, nil // Don't retry abort
-		}
-		if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
-			fs.Debugf(s.f, "Abort returned status %d", res.StatusCode)
-		}
-		return false, nil
-	})
-	if err != nil {
-		return fmt.Errorf("failed to abort multipart upload: %w", err)
-	}
-	fs.Debugf(s.f, "Successfully aborted multipart upload")
-	return nil
-}
